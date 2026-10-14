@@ -1428,7 +1428,12 @@ int qtsq_decompress_tensor(const qtsq_context_t *ctx,
     if (mode == TENSOR_MODE_LOSSLESS) {
         if (uncomp_size != count * sizeof(float)) return QTSQ_ERR_FORMAT;
     } else if (mode == TENSOR_MODE_DELTA) {
-        if (count > 1 && uncomp_size != (count - 1) * sizeof(int32_t)) return QTSQ_ERR_FORMAT;
+        /* Bind uncomp_size for count == 1 too. The other modes pin it
+         * unconditionally; here a single-element tensor left it free,
+         * and it flowed straight into malloc() -- a 40-byte TNS2 header
+         * could request an arbitrary allocation. */
+        if (count == 0 || uncomp_size != (count - 1) * sizeof(int32_t))
+            return QTSQ_ERR_FORMAT;
     } else if (mode == TENSOR_MODE_F16) {
         if (uncomp_size != count * sizeof(uint16_t)) return QTSQ_ERR_FORMAT;
     } else if (mode == TENSOR_MODE_F8) {

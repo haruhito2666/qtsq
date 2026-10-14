@@ -57,7 +57,7 @@ static void hmac_sha3_256(const uint8_t *key, size_t key_len,
 /* Argon2id password KDF (Phase 2a: replaced homemade iterated SHA3-256).
  * Default params: t_cost=3, m_cost=64MB, parallelism=4 — tuned for security
  * vs. acceptable interactive latency (~100-200ms on modern hardware). */
-static void derive_password_key(const char *password, const uint8_t salt[32],
+static int derive_password_key(const char *password, const uint8_t salt[32],
                                 uint32_t iterations, uint8_t key[32]) {
     (void)iterations;  /* ignored; Argon2 cost is in t_cost/m_cost, not iteration count */
     
@@ -73,9 +73,15 @@ static void derive_password_key(const char *password, const uint8_t salt[32],
     );
     
     if (ret != ARGON2_OK) {
-        /* Fallback: should never happen, but zero the key on failure */
+        /* Never fall back to an all-zero key: the caller would encrypt
+         * under a key anyone can derive, and report success. m_cost is
+         * 64 MB, so an allocation failure here is routine on memory-
+         * capped targets rather than "should never happen". Fail, and
+         * let the caller refuse to write the file. */
         memset(key, 0, 32);
+        return QTSQ_ERR_ALLOC;
     }
+    return QTSQ_OK;
 }
 
 /* ═══ Authenticated Encryption (AES-256-CTR + HMAC-SHA3-256) ═══ */
@@ -253,7 +259,8 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
     
     uint8_t key[32];
     uint8_t *salt = was_pq_encrypted ? (ctx->security.signature + 3277) : ctx->security.salt;
-    derive_password_key(password, salt, ctx->security.kdf_iterations, key);
+    if (derive_password_key(password, salt, ctx->security.kdf_iterations, key) != QTSQ_OK)
+        return QTSQ_ERR_ALLOC;
 
     int res = vault_sym_encrypt(ctx, key, ctx->security.nonce);
     qtsq_secure_zero(key, 32);
@@ -280,7 +287,8 @@ int qtsq_vault_decrypt_password(qtsq_context_t *ctx, const char *password) {
     uint8_t *salt = is_layered ? (ctx->security.signature + 3277) : ctx->security.salt;
 
     uint8_t key[32];
-    derive_password_key(password, salt, ctx->security.kdf_iterations, key);
+    if (derive_password_key(password, salt, ctx->security.kdf_iterations, key) != QTSQ_OK)
+        return QTSQ_ERR_ALLOC;
 
     int res = vault_sym_decrypt(ctx, key, ctx->security.nonce);
     qtsq_secure_zero(key, 32);

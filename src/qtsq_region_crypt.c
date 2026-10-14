@@ -121,6 +121,12 @@ int qtsq_region_load_metadata(const qtsq_context_t *ctx,
     for (int i = 0; i < *num_regions; i++) {
         int off = 5 + i * 9;
         regions[i].key_id = enc[off + 0];
+        /* key_id indexes the caller's key arrays, which hold
+         * QTSQ_MAX_REGIONS entries. It comes straight out of the
+         * cleartext header, so an out-of-range value would read (and
+         * on the encrypt path, pass to a memcpy) a pointer up to 8 KB
+         * past the end of those arrays. */
+        if (regions[i].key_id >= QTSQ_MAX_REGIONS) return QTSQ_ERR_FORMAT;
         regions[i].x = (uint32_t)(enc[off + 1]) | ((uint32_t)(enc[off + 2]) << 8);
         regions[i].y = (uint32_t)(enc[off + 3]) | ((uint32_t)(enc[off + 4]) << 8);
         regions[i].w = (uint32_t)(enc[off + 5]) | ((uint32_t)(enc[off + 6]) << 8);
@@ -176,6 +182,9 @@ int qtsq_region_decrypt_splats(splat2d_t *splats, uint32_t count,
     for (uint32_t i = 0; i < count; i++) {
         int kid = classify_splat(&splats[i], regions, num_regions);
         if (kid < 0) continue; /* public splat */
+        if (kid >= QTSQ_MAX_REGIONS) continue; /* unreachable after the
+                                                 * load-time check above;
+                                                 * belt and braces */
         if (!keys[kid]) continue; /* no key for this region — leave encrypted */
 
         uint8_t subkey[32];

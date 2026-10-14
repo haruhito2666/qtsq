@@ -1158,6 +1158,43 @@ int qtsq_container_get_stream(const qtsq_context_t *ctx, uint32_t index,
 
 #define SHA3_256_BLOCK_SIZE 136
 
+/* AES-256-CTR, applied as encryption.
+ *
+ * The vendored PQClean aes256_ctr() emits the KEYSTREAM ONLY -- it never
+ * reads its input buffer. Every caller must XOR the result with the
+ * payload itself. The container stream paths used to call it directly,
+ * which wrote the raw keystream over the plaintext and then, on
+ * decrypt, wrote that same keystream over itself: the payload was
+ * unrecoverable and had never been confidential, while the HMAC over
+ * the keystream still validated. Same shape as qtsq_vault.c's
+ * encrypt/decrypt, which already does this correctly.
+ *
+ * CTR is symmetric, so one routine serves both directions. Returns 0 on
+ * success, non-zero if the keystream buffer could not be allocated --
+ * callers must propagate that, never treat it as "done".
+ */
+static int container_ctr_xor(uint8_t *payload, size_t len,
+                             const uint8_t nonce[12], const uint8_t key[32]) {
+    if (len == 0) return 0;
+    if (len > SIZE_MAX - 16) return 1;
+
+    uint8_t *keystream = (uint8_t *)malloc(len + 16);
+    if (!keystream) return 1;
+
+    uint8_t iv[16] = {0};
+    memcpy(iv, nonce, 12);
+    aes256ctx aes;
+    aes256_ctr_keyexp(&aes, key);
+    aes256_ctr(keystream, len, iv, &aes);
+    aes256_ctx_release(&aes);
+
+    for (size_t i = 0; i < len; i++) payload[i] ^= keystream[i];
+
+    qtsq_secure_zero(keystream, len + 16);
+    free(keystream);
+    return 0;
+}
+
 static void container_hmac_sha3_256(const uint8_t *key, size_t key_len,
                                      const uint8_t *data, size_t data_len,
                                      uint8_t out[32]) {
@@ -1228,7 +1265,15 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     derive_name_key(ctx, name_key);
     uint8_t name_buf[CONTAINER_NAME_MAX];
     memset(name_buf, 0, sizeof(name_buf));
-    memcpy(name_buf, buf + stream_start, CONTAINER_NAME_MAX > entry.data_offset ? CONTAINER_NAME_MAX : 0);
+    /* Bound the copy by what is actually left in the buffer. The old
+     * expression compared CONTAINER_NAME_MAX against entry.data_offset
+     * and used that as the length -- it never looked at the remaining
+     * bytes, and stream_start itself was unchecked, so a small
+     * container over-read the heap by up to 256 bytes. */
+    if (stream_start >= ctx->singularity_size) return QTSQ_ERR_FORMAT;
+    size_t avail = ctx->singularity_size - stream_start;
+    size_t ncopy = avail < CONTAINER_NAME_MAX ? avail : CONTAINER_NAME_MAX;
+    memcpy(name_buf, buf + stream_start, ncopy);
     if (name_encryption_active(ctx)) {
         name_crypt(name_buf, CONTAINER_NAME_MAX, name_key);
     }
@@ -1261,13 +1306,11 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     uint8_t *payload = ctx->singularity + payload_start;
     size_t payload_size = entry.data_size;
 
-    /* AES-256-CTR encrypt */
-    uint8_t iv[16] = {0};
-    memcpy(iv, enc.nonce, 12);
-    aes256ctx aes;
-    aes256_ctr_keyexp(&aes, shared_secret);
-    aes256_ctr(payload, payload_size, iv, &aes);
-    aes256_ctx_release(&aes);
+    /* AES-256-CTR encrypt (keystream XORed into the payload) */
+    if (container_ctr_xor(payload, payload_size, enc.nonce, shared_secret) != 0) {
+        qtsq_secure_zero(shared_secret, 32);
+        return QTSQ_ERR_ALLOC;
+    }
 
     /* Compute HMAC-SHA3-256 auth tag */
     uint8_t full_mac[32];
@@ -1275,7 +1318,6 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     memcpy(enc.auth_tag, full_mac, 16);
 
     qtsq_secure_zero(shared_secret, 32);
-    qtsq_secure_zero(&aes, sizeof(aes));
 
     /* Now we need to prepend the encryption header to the payload.
      * This requires reallocating the singularity buffer. */
@@ -1355,10 +1397,26 @@ int qtsq_container_decrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     size_t data_block_start = 4 + num_streams * sizeof(qtsq_stream_entry_t);
     size_t stream_start = data_block_start + entry.data_offset;
 
-    /* Skip the name */
-    const char *name_ptr = (const char *)(buf + stream_start);
-    size_t name_len = strnlen(name_ptr, CONTAINER_NAME_MAX);
-    size_t padded_name = (name_len + 1 + 3) & ~(size_t)3;
+    /* Skip the name to find the encryption header.
+     *
+     * M10 fix (mirrors qtsq_container_encrypt_stream): when name
+     * encryption is active the NUL terminator is XOR'd to a non-zero
+     * byte, so a raw strnlen runs past it and returns some essentially
+     * arbitrary length. That yields the wrong padded_name, so enc_start
+     * points into the middle of the payload and every later check
+     * fails. Decrypt the name into a temporary buffer first. */
+    uint8_t dname_key[32];
+    derive_name_key(ctx, dname_key);
+    uint8_t dname_buf[CONTAINER_NAME_MAX];
+    memset(dname_buf, 0, sizeof(dname_buf));
+    size_t dname_copy = CONTAINER_NAME_MAX;
+    if (dname_copy > ctx->singularity_size - stream_start)
+        dname_copy = ctx->singularity_size - stream_start;
+    if (dname_copy) memcpy(dname_buf, buf + stream_start, dname_copy);
+    if (name_encryption_active(ctx))
+        name_crypt(dname_buf, CONTAINER_NAME_MAX, dname_key);
+    size_t dname_len = strnlen((const char *)dname_buf, CONTAINER_NAME_MAX);
+    size_t padded_name = (dname_len + 1 + 3) & ~(size_t)3;
     size_t enc_start = stream_start + padded_name;
 
     if (enc_start + sizeof(qtsq_stream_encryption_t) > ctx->singularity_size)
@@ -1376,11 +1434,25 @@ int qtsq_container_decrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
         return QTSQ_ERR_DECRYPT;
     }
 
-    /* Verify HMAC */
+    /* Verify HMAC.
+     *
+     * entry.data_size is an attacker-controlled uint64_t read straight
+     * from the TOC. It must be large enough to contain the encryption
+     * header before it is subtracted: otherwise the subtraction wraps to
+     * ~2^64 and the bounds check below wraps identically, so it passes
+     * and the ~2^64 length reaches the hash and the cipher.
+     * Reject rather than clamp -- a stream smaller than its own header
+     * is malformed and has no valid reading. */
+    if (entry.data_size < sizeof(qtsq_stream_encryption_t)) {
+        qtsq_secure_zero(shared_secret, 32);
+        return QTSQ_ERR_FORMAT;
+    }
+
     size_t payload_start = enc_start + sizeof(qtsq_stream_encryption_t);
     size_t payload_size = entry.data_size - sizeof(qtsq_stream_encryption_t);
 
-    if (payload_start + payload_size > ctx->singularity_size) {
+    if (payload_size > ctx->singularity_size
+        || payload_start > ctx->singularity_size - payload_size) {
         qtsq_secure_zero(shared_secret, 32);
         return QTSQ_ERR_FORMAT;
     }
@@ -1389,28 +1461,38 @@ int qtsq_container_decrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     uint8_t full_mac[32];
     container_hmac_sha3_256(shared_secret, 32, payload, payload_size, full_mac);
 
-    if (memcmp(enc.auth_tag, full_mac, 16) != 0) {
+    /* Constant time: memcmp short-circuits on the first differing byte,
+     * leaking how much of a forged tag was right. Every sibling path
+     * was already fixed for this (qtsq_vault.c, qtsq_deniable.c,
+     * qtsq_censorship.c); this one was missed. */
+    uint8_t diff = 0;
+    for (int i = 0; i < 16; i++) diff |= (uint8_t)(enc.auth_tag[i] ^ full_mac[i]);
+    if (diff != 0) {
         qtsq_secure_zero(shared_secret, 32);
         return QTSQ_ERR_DECRYPT;
     }
 
-    /* Decrypt in-place */
-    uint8_t iv[16] = {0};
-    memcpy(iv, enc.nonce, 12);
-    aes256ctx aes;
-    aes256_ctr_keyexp(&aes, shared_secret);
-    aes256_ctr(payload, payload_size, iv, &aes);
-    aes256_ctx_release(&aes);
+    /* Decrypt in-place (identical transform; CTR is symmetric) */
+    if (container_ctr_xor(payload, payload_size, enc.nonce, shared_secret) != 0) {
+        qtsq_secure_zero(shared_secret, 32);
+        return QTSQ_ERR_ALLOC;
+    }
 
     qtsq_secure_zero(shared_secret, 32);
-    qtsq_secure_zero(&aes, sizeof(aes));
 
     /* Remove the encryption header from the buffer.
-     * Shift everything after the payload backward. */
+     *
+     * The payload was decrypted in place AT payload_start, which is the
+     * first byte after the header. So the header is what has to be
+     * overwritten: shift the payload BACK by one header length. The old
+     * code shifted from payload_start + enc_header_size, i.e. it moved
+     * the bytes that follow the payload and left the ciphertext sitting
+     * where the plaintext belonged -- so a "successful" decrypt returned
+     * the original ciphertext. */
     size_t enc_header_size = sizeof(qtsq_stream_encryption_t);
-    memmove(ctx->singularity + payload_start,
-            ctx->singularity + payload_start + enc_header_size,
-            ctx->singularity_size - payload_start - enc_header_size);
+    memmove(ctx->singularity + enc_start,
+            ctx->singularity + payload_start,
+            payload_size);
 
     size_t new_size = ctx->singularity_size - enc_header_size;
     ctx->singularity_size = new_size;

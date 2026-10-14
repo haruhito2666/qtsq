@@ -33,7 +33,7 @@
 
 /* ── Key derivation (M3 fix: Argon2id, same params as the vault) ── */
 
-static void deniable_kdf(const char *password, const uint8_t salt[32],
+static int deniable_kdf(const char *password, const uint8_t salt[32],
                           uint32_t iters, uint8_t key[32]) {
     (void)iters; /* Argon2 cost is in t_cost/m_cost, not iteration count */
     int ret = argon2id_hash_raw(
@@ -42,8 +42,12 @@ static void deniable_kdf(const char *password, const uint8_t salt[32],
         salt, 32,
         key, 32);
     if (ret != ARGON2_OK) {
+        /* Zero key on failure would encrypt under a publicly known key.
+         * Propagate instead; see qtsq_vault.c derive_password_key. */
         memset(key, 0, 32);
+        return QTSQ_ERR_ALLOC;
     }
+    return QTSQ_OK;
 }
 
 /* ── AES-256-CTR stream ── */

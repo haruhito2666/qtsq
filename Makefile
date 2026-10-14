@@ -202,7 +202,7 @@ test_format_spec:
 PHASE_TESTS = test_layered_encryption test_shamir_csprng test_two_intent \
               test_geometry_seal test_freqdct test_container_name_enc \
               test_security test_gf256 test_splat2d test_surfel \
-              test_photon_fusion test_turbo test_model \
+              test_photon_fusion test_turbo test_model test_stream_crypto \
               test_qtc_integration test_video_pixel
 
 define RUN_PHASE_TESTS

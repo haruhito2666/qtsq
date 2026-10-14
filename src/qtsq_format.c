@@ -360,7 +360,22 @@ int qtsq_read(qtsq_context_t *ctx, const char *filename) {
     }
 
     if (ctx->header.radiation_size > 0) {
-        ctx->num_radiation = ctx->header.radiation_size / sizeof(qtsq_index_t);
+        /* singularity_size and the recovery block are both capped; this
+         * one was not, so a 4-byte header could request a multi-GB
+         * calloc with no relationship to the file it came from. Bound
+         * it against what the file can actually hold, and against the
+         * count a uint32_t can express without truncating. */
+        long cur = ftell(f);
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return QTSQ_ERR_IO; }
+        long fsz = ftell(f);
+        if (fsz < 0 || cur < 0) { fclose(f); return QTSQ_ERR_IO; }
+        if (fseek(f, cur, SEEK_SET) != 0) { fclose(f); return QTSQ_ERR_IO; }
+        if (ctx->header.radiation_size > (uint64_t)(fsz - cur)) {
+            fclose(f); return QTSQ_ERR_FORMAT;
+        }
+        uint64_t nrad = ctx->header.radiation_size / sizeof(qtsq_index_t);
+        if (nrad == 0 || nrad > UINT32_MAX) { fclose(f); return QTSQ_ERR_FORMAT; }
+        ctx->num_radiation = (uint32_t)nrad;
         ctx->radiation_index = calloc(ctx->num_radiation, sizeof(qtsq_index_t));
         if (!ctx->radiation_index) { fclose(f); return QTSQ_ERR_ALLOC; }
         if (fread(ctx->radiation_index, sizeof(qtsq_index_t), ctx->num_radiation, f) != ctx->num_radiation) {

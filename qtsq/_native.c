@@ -195,8 +195,13 @@ static PyObject* py_read_vertices(PyObject *self, PyObject *args, PyObject *kwar
     }
     free(verts);
 
-    return Py_BuildValue("{s:O,s:I,s:I,s:i}",
+    PyObject *res = Py_BuildValue("{s:O,s:I,s:I,s:i}",
         "vertices", vert_list, "width", width, "height", height, "num_vertices", nv);
+    /* "O" in Py_BuildValue takes a NEW reference, so the one held by
+     * PyList_New must be dropped. Without this the list -- and every
+     * vertex tuple it owns -- leaked on every call. */
+    Py_DECREF(vert_list);
+    return res;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -220,9 +225,23 @@ static PyObject* py_compress_image(PyObject *self, PyObject *args, PyObject *kwa
                           &password, &codec, &quality))
         return NULL;
 
-    if ((Py_ssize_t)(w * h * ch) != pixels_len) {
+    /* w, h are unsigned int and ch is unsigned char, so w*h*ch is
+     * evaluated in unsigned 32-bit arithmetic and wraps BEFORE it is
+     * widened. A caller-supplied 65536x65536x3 wrapped to 0, passed
+     * the check against an empty buffer, and the library then walked a
+     * 0-byte allocation with 65536x65536 dimensions (SIGSEGV).
+     * Compute in size_t and reject anything that will not fit. */
+    size_t expect_px = (size_t)w * (size_t)h * (size_t)ch;
+    if (expect_px / (size_t)ch / (size_t)h != (size_t)w ||
+        expect_px > (size_t)PY_SSIZE_T_MAX) {
         PyErr_Format(PyExc_ValueError,
-            "Pixel buffer size mismatch: expected %u, got %zd", w*h*ch, pixels_len);
+            "Image dimensions too large: %u x %u x %u", w, h, ch);
+        return NULL;
+    }
+    if ((Py_ssize_t)expect_px != pixels_len) {
+        PyErr_Format(PyExc_ValueError,
+            "Pixel buffer size mismatch: expected %zu, got %zd",
+            expect_px, pixels_len);
         return NULL;
     }
 
@@ -1597,6 +1616,16 @@ fail_jobs:
             PyObject *pair = PySequence_Fast(PySequence_Fast_GET_ITEM(bp, i),
                                              "each blob param must be (p0, p1)");
             if (!bname || PyErr_Occurred()) { Py_XDECREF(pair); break; }
+            /* The parallel-list length check above only proves the
+             * lists agree with each other, NOT that each entry is a
+             * 2-sequence. GET_ITEM is a raw ob_item[] with no bounds
+             * or NULL check, so an empty or 1-element pair crashed. */
+            if (PySequence_Fast_GET_SIZE(pair) < 2) {
+                PyErr_SetString(PyExc_ValueError,
+                    "each blob param must be a (p0, p1) pair");
+                Py_DECREF(pair);
+                break;
+            }
             long p0 = PyLong_AsLong(PySequence_Fast_GET_ITEM(pair, 0));
             long p1 = PyLong_AsLong(PySequence_Fast_GET_ITEM(pair, 1));
             Py_XDECREF(pair);
