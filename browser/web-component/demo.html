@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QTSQ Web Viewer Demo</title>
+    <script type="module" src="./qtsq-viewer.js"></script>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #f9fafb;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+        .card {
+            background: white;
+            padding: 1rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        h2 { font-size: 1.2rem; margin-top: 0; }
+        qtsq-viewer {
+            width: 100%;
+            height: 300px;
+        }
+    </style>
+</head>
+<body>
+    <h1>QTSQ Web Component</h1>
+    <p>Using the <code>&lt;qtsq-viewer&gt;</code> custom element powered by WebAssembly.</p>
+    
+    <div class="grid">
+        <div class="card">
+            <h2>CPU Test Image</h2>
+            <qtsq-viewer src="../../test_cpu.qtsq"></qtsq-viewer>
+        </div>
+        
+        <div class="card">
+            <h2>Missing File (Error State)</h2>
+            <qtsq-viewer src="does_not_exist.qtsq"></qtsq-viewer>
+        </div>
+    </div>
+</body>
+</html>

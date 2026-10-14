@@ -1,0 +1,83 @@
+.quadcodeai/
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+
+# Release signing secrets — never commit
+android/keystore.properties
+android/app/qtsq-release-key.jks
+
+# macOS
+.DS_Store
+
+# ── Build outputs (regenerate with `make` / `python -m build`) ─────────────
+bin/
+build/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+*.metallib
+*.o.dSYM/
+qtsq.egg-info/
+
+# Generated macOS app bundles (the .xcodeproj files are tracked; these are not)
+*.app/
+build.log
+
+# Editor / agent scratch directories
+.cache/
+.clangd
+.commandcode/
+.mimosa/
+.snapshot/
+.sofuu/
+.zcode/
+-o
+
+# Large generated site (136M of build output, not source)
+website/
+
+# ══ Public repository policy: main codebase only ══════════════════════════
+# These stay on disk but are not published to GitHub.
+docs/
+tests/
+tools/
+proof/
+data/
+website/
+prototype/
+plugins/
+meta/
+compressor/results/
+compressor/bench/
+*.log
+
+# Internal planning, audit and legal documents
+AUTHORSHIP_SEAL.md
+LEGAL.md
+CONCEPT.md
+PRODUCT.md
+PHASE_D_PLAN.md
+COMPRESSION_LIBRARY_PLAN.md
+REMEDIATION_TODO.md
+CHANGELOG.md
+
+# Generated editor/Xcode output
+compile_commands.json
+*.plist
+profile/
+
+# Stale duplicate copies of src/qtsq_video_{decode,encode}.c that sit
+# in the repo root and are not referenced by the build
+/qtsq_video_decode.c
+/qtsq_video_encode.c
+
+# Test fixtures
+src/test-images/

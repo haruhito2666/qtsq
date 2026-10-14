@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "QTSQ Viewer",
+  "version": "1.0.0",
+  "description": "View Quantum Tensor Sequence (.qtsq) files directly in your browser.",
+  "permissions": [
+    "webRequest",
+    "declarativeNetRequest",
+    "downloads"
+  ],
+  "host_permissions": [
+    "*://*/*.qtsq",
+    "file:///*/*.qtsq"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["viewer.html", "qtsq-decoder.wasm", "qtsq-viewer.js", "qtsq-decoder.js", "qtsq-decoder-class.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

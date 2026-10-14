@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <include domain="sharedpref" path="."/>
+    <exclude domain="sharedpref" path="device.xml"/>
+    <!-- QTSQ privacy: device keypair + captured media never leave the device -->
+    <exclude domain="file" path="qtsq"/>
+    <exclude domain="file" path=".qtsq"/>
+    <exclude domain="file" path="captures"/>
+</full-backup-content>

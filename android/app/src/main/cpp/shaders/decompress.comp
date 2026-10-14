@@ -1,0 +1,116 @@
+#version 450
+
+/*
+ * QTSQ Decompression Shader — GPU-accelerated IFS iteration
+ *
+ * Each workgroup = 1 range block.
+ * Thread 0 handles the block (simple enough for single-thread per block).
+ * Many blocks run in parallel across GPU shader processors.
+ *
+ * Per block: read domain from 'current', downsample, apply symmetry,
+ * map with contrast/brightness, write to 'next'.
+ * No searching, no branching — perfect GPU workload.
+ */
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+/* current iteration buffer (read) — float per pixel */
+layout(set = 0, binding = 0) readonly buffer CurrentBuf {
+    float current_pixels[];
+};
+
+/* next iteration buffer (write) — float per pixel */
+layout(set = 0, binding = 1) buffer NextBuf {
+    float next_pixels[];
+};
+
+/* packed transforms: 2 × uint32 per block (ifs_transform_t) */
+layout(set = 0, binding = 2) readonly buffer TransformBuf {
+    uvec2 transforms[];
+};
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint range_size;
+    uint domain_size;
+    uint blocks_x;
+    uint blocks_y;
+    uint total_blocks;
+};
+
+void getSymCoords(uint x, uint y, uint S, uint sym, out uint sx, out uint sy) {
+    uint Sm = S - 1u;
+    switch (sym) {
+        case 0u: sx = x;      sy = y;      break;
+        case 1u: sx = Sm - x; sy = y;      break;
+        case 2u: sx = x;      sy = Sm - y; break;
+        case 3u: sx = Sm - x; sy = Sm - y; break;
+        case 4u: sx = y;      sy = x;      break;
+        case 5u: sx = Sm - y; sy = x;      break;
+        case 6u: sx = y;      sy = Sm - x; break;
+        case 7u: sx = Sm - y; sy = Sm - x; break;
+        default: sx = x;      sy = y;      break;
+    }
+}
+
+void main() {
+    uint block_id = gl_WorkGroupID.x;
+    if (block_id >= total_blocks) return;
+
+    uint bx = block_id % blocks_x;
+    uint by = block_id / blocks_x;
+
+    /* Unpack transform (matches ifs_transform_t little-endian layout) */
+    uvec2 tf = transforms[block_id];
+    uint domain_x = tf.x & 0xFFFFu;
+    uint domain_y = (tf.x >> 16u) & 0xFFFFu;
+    uint sym = tf.y & 0xFFu;
+    int contrast_q = int((tf.y >> 8u) & 0xFFu);
+    /* Sign-extend int8 */
+    if (contrast_q > 127) contrast_q -= 256;
+    int brightness_q = int((tf.y >> 16u) & 0xFFFFu);
+    /* Sign-extend int16 */
+    if (brightness_q > 32767) brightness_q -= 65536;
+
+    float s = float(contrast_q) / 128.0;
+    float o = float(brightness_q);
+
+    uint RS = range_size;
+    uint DS = domain_size;
+
+    /* Bounds check */
+    if (domain_x + DS > width || domain_y + DS > height) return;
+
+    /* For each pixel in the range block:
+     * 1. Downsample 2×2 from domain in 'current'
+     * 2. Apply symmetry
+     * 3. Map: val = s * downsampled_sym + o
+     * 4. Clamp and write to 'next'
+     */
+    for (uint ry = 0u; ry < RS; ry++) {
+        for (uint rx = 0u; rx < RS; rx++) {
+            /* Apply symmetry to get source coords in downsampled domain */
+            uint src_x, src_y;
+            getSymCoords(rx, ry, RS, sym, src_x, src_y);
+
+            /* Downsample: average 2×2 block from current */
+            float a = current_pixels[(domain_y + src_y * 2u)     * width + (domain_x + src_x * 2u)];
+            float b = current_pixels[(domain_y + src_y * 2u)     * width + (domain_x + src_x * 2u + 1u)];
+            float c = current_pixels[(domain_y + src_y * 2u + 1u) * width + (domain_x + src_x * 2u)];
+            float d = current_pixels[(domain_y + src_y * 2u + 1u) * width + (domain_x + src_x * 2u + 1u)];
+            float downsampled = (a + b + c + d) * 0.25;
+
+            /* Apply affine mapping */
+            float val = s * downsampled + o;
+            val = clamp(val, 0.0, 255.0);
+
+            /* Write to output */
+            uint out_x = bx * RS + rx;
+            uint out_y = by * RS + ry;
+            if (out_x < width && out_y < height) {
+                next_pixels[out_y * width + out_x] = val;
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+# Include all C source and headers for compilation
+recursive-include src *.c *.h
+recursive-include include *.h
+# Phase 6a: qtc compression library sources (compiled in-tree by setup.py).
+# NOTE: internal headers (e.g. compressor/src/qtc_internal.h) MUST ship —
+# without them the wheel-from-sdist build (and any pip install from the
+# sdist on another machine) fails. Past 2.0.x sdists were affected.
+recursive-include compressor/src *.c *.h
+recursive-include compressor/include *.h
+# Post-quantum crypto sources (compiled in-tree by setup.py)
+recursive-include crypto *.c *.h
+# Include ALL Python and C files from the package
+recursive-include qtsq *.py *.c *.md
+# Weight-track tests (C + Python)
+recursive-include tests *.c *.py *.h
+include setup.py

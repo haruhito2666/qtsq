@@ -1,0 +1,70 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+
+  <!-- Background fill -->
+  <path
+      android:fillColor="#0A0E1A"
+      android:pathData="M0,0h512v512H0z"/>
+
+  <!-- Vortex ring 1 - outermost -->
+  <path
+      android:pathData="M256,101 A155,155 0 1,1 255.99,101"
+      android:strokeColor="#6C5CE7"
+      android:strokeAlpha="0.2"
+      android:strokeWidth="2"
+      android:fillColor="#00000000"/>
+
+  <!-- Vortex ring 2 -->
+  <path
+      android:pathData="M256,134 A122,122 0 1,1 255.99,134"
+      android:strokeColor="#6C5CE7"
+      android:strokeAlpha="0.3"
+      android:strokeWidth="2.5"
+      android:fillColor="#00000000"/>
+
+  <!-- Vortex ring 3 -->
+  <path
+      android:pathData="M256,166 A90,90 0 1,1 255.99,166"
+      android:strokeColor="#7C6AF0"
+      android:strokeAlpha="0.45"
+      android:strokeWidth="3"
+      android:fillColor="#00000000"/>
+
+  <!-- Vortex ring 4 -->
+  <path
+      android:pathData="M256,194 A62,62 0 1,1 255.99,194"
+      android:strokeColor="#8B7AF5"
+      android:strokeAlpha="0.6"
+      android:strokeWidth="3.5"
+      android:fillColor="#00000000"/>
+
+  <!-- Vortex ring 5 -->
+  <path
+      android:pathData="M256,218 A38,38 0 1,1 255.99,218"
+      android:strokeColor="#A78BFA"
+      android:strokeAlpha="0.75"
+      android:strokeWidth="4"
+      android:fillColor="#00000000"/>
+
+  <!-- Vortex ring 6 - innermost -->
+  <path
+      android:pathData="M256,238 A18,18 0 1,1 255.99,238"
+      android:strokeColor="#A78BFA"
+      android:strokeAlpha="0.9"
+      android:strokeWidth="4.5"
+      android:fillColor="#00000000"/>
+
+  <!-- Core glow -->
+  <path
+      android:pathData="M256,244 A12,12 0 1,1 255.99,244"
+      android:fillColor="#FFFFFF"
+      android:fillAlpha="0.7"/>
+
+  <!-- Core dot -->
+  <path
+      android:pathData="M256,252 A4,4 0 1,1 255.99,252"
+      android:fillColor="#FFFFFF"/>
+</vector>

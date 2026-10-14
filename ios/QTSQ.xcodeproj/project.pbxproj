@@ -1,0 +1,447 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0777281EFC3E3C2A477FD064 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E15D9D13A28DDC71549BE289 /* ContentView.swift */; };
+		0A8B9CB39A9AE547AC313991 /* qtsq.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 3BB4B9CC2A8B8261370BC381 /* qtsq.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		3A403B7455E5E1DA0A6CBC79 /* AudioView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3485E99B0ACFBBB29EC022B /* AudioView.swift */; };
+		46BEA1C821B6052FF176045A /* QTSQApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7EE0D307A315F78A9A83072 /* QTSQApp.swift */; };
+		6174ED7BF4792CA37BFE9F54 /* ProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67DC8214DA3CD2C307E142D1 /* ProfileView.swift */; };
+		723D8E8B1002FAB0B0C0C63C /* CameraView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37EEB16D81DBB86C1A4982ED /* CameraView.swift */; };
+		7A6E396A4B3F95E0A7FD7B03 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53C9BA26144CBB924D7034A8 /* LibraryView.swift */; };
+		83EF3DD1C95E9B48279A1A25 /* qtsq.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3BB4B9CC2A8B8261370BC381 /* qtsq.xcframework */; };
+		92BD2E8295F7BE5A89307D47 /* ConvertView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B215103D8CD63BB3E2DFD91F /* ConvertView.swift */; };
+		BA538F3BD86C870779909B35 /* QtsqEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A505CE92E77507F2E1FF634C /* QtsqEngine.swift */; };
+		C2C6AAA7EDA8CA7A6793A059 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2133D00CF9C77724540022EA /* Components.swift */; };
+		C7F283460D959AB32628609A /* ViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88EDA7E2736B11D887ACE9EF /* ViewerView.swift */; };
+		CA695A85FED07038282098E8 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = E894A9031E8798E32EBEC591 /* DesignTokens.swift */; };
+		E2A85D92FC39076E8D82F125 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F4C95EF89ED36ADFAE88A12 /* HomeView.swift */; };
+		F1A8CBC58BED1460D21FFCAE /* DecryptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38F3CF6434386E7E76582C6A /* DecryptView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		DC7CC843D00FA7A647A80A53 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				0A8B9CB39A9AE547AC313991 /* qtsq.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		2133D00CF9C77724540022EA /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		37EEB16D81DBB86C1A4982ED /* CameraView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraView.swift; sourceTree = "<group>"; };
+		38F3CF6434386E7E76582C6A /* DecryptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecryptView.swift; sourceTree = "<group>"; };
+		3BB4B9CC2A8B8261370BC381 /* qtsq.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = qtsq.xcframework; path = lib/qtsq.xcframework; sourceTree = "<group>"; };
+		4F4C95EF89ED36ADFAE88A12 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		53C9BA26144CBB924D7034A8 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
+		67DC8214DA3CD2C307E142D1 /* ProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileView.swift; sourceTree = "<group>"; };
+		88EDA7E2736B11D887ACE9EF /* ViewerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerView.swift; sourceTree = "<group>"; };
+		992631C8BB9B1E0DF7624C08 /* QTSQ-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "QTSQ-Bridging-Header.h"; sourceTree = "<group>"; };
+		A3485E99B0ACFBBB29EC022B /* AudioView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioView.swift; sourceTree = "<group>"; };
+		A505CE92E77507F2E1FF634C /* QtsqEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QtsqEngine.swift; sourceTree = "<group>"; };
+		B215103D8CD63BB3E2DFD91F /* ConvertView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConvertView.swift; sourceTree = "<group>"; };
+		E15D9D13A28DDC71549BE289 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		E7EE0D307A315F78A9A83072 /* QTSQApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QTSQApp.swift; sourceTree = "<group>"; };
+		E894A9031E8798E32EBEC591 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		EE0C4F15C646EA14F54DF42E /* QTSQ.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = QTSQ.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D3D01E38CB9C7AE22628FAB9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				83EF3DD1C95E9B48279A1A25 /* qtsq.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		180328D26F13D8BE0B5C1F03 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				EE0C4F15C646EA14F54DF42E /* QTSQ.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		3FA5AD8D99E194CA6F220F16 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				2133D00CF9C77724540022EA /* Components.swift */,
+				E894A9031E8798E32EBEC591 /* DesignTokens.swift */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		3FFCAAB9DA6AAEF1F8D8D39D /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				3BB4B9CC2A8B8261370BC381 /* qtsq.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		55832FD33AAD5EF6EDD695FC /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A3485E99B0ACFBBB29EC022B /* AudioView.swift */,
+				37EEB16D81DBB86C1A4982ED /* CameraView.swift */,
+				B215103D8CD63BB3E2DFD91F /* ConvertView.swift */,
+				38F3CF6434386E7E76582C6A /* DecryptView.swift */,
+				4F4C95EF89ED36ADFAE88A12 /* HomeView.swift */,
+				53C9BA26144CBB924D7034A8 /* LibraryView.swift */,
+				67DC8214DA3CD2C307E142D1 /* ProfileView.swift */,
+				88EDA7E2736B11D887ACE9EF /* ViewerView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		98B82C6C28683B720ECF26DB /* QTSQ */ = {
+			isa = PBXGroup;
+			children = (
+				E15D9D13A28DDC71549BE289 /* ContentView.swift */,
+				992631C8BB9B1E0DF7624C08 /* QTSQ-Bridging-Header.h */,
+				E7EE0D307A315F78A9A83072 /* QTSQApp.swift */,
+				AAAA9F2CD09530BA758859FA /* Engine */,
+				3FA5AD8D99E194CA6F220F16 /* Theme */,
+				55832FD33AAD5EF6EDD695FC /* Views */,
+			);
+			path = QTSQ;
+			sourceTree = "<group>";
+		};
+		AAAA9F2CD09530BA758859FA /* Engine */ = {
+			isa = PBXGroup;
+			children = (
+				A505CE92E77507F2E1FF634C /* QtsqEngine.swift */,
+			);
+			path = Engine;
+			sourceTree = "<group>";
+		};
+		F9017F60565CB45FE70AFD03 = {
+			isa = PBXGroup;
+			children = (
+				98B82C6C28683B720ECF26DB /* QTSQ */,
+				3FFCAAB9DA6AAEF1F8D8D39D /* Frameworks */,
+				180328D26F13D8BE0B5C1F03 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		CD1EC86EB0676DFC56632B8F /* QTSQ */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 46360D67AAD784BB429CACA6 /* Build configuration list for PBXNativeTarget "QTSQ" */;
+			buildPhases = (
+				CDEB1B7778531B04B48D8171 /* Sources */,
+				D3D01E38CB9C7AE22628FAB9 /* Frameworks */,
+				DC7CC843D00FA7A647A80A53 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = QTSQ;
+			packageProductDependencies = (
+			);
+			productName = QTSQ;
+			productReference = EE0C4F15C646EA14F54DF42E /* QTSQ.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D57AFD6E561834853C4667E7 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = F50C60243AEB6D398C9E0BA8 /* Build configuration list for PBXProject "QTSQ" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F9017F60565CB45FE70AFD03;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				CD1EC86EB0676DFC56632B8F /* QTSQ */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		CDEB1B7778531B04B48D8171 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3A403B7455E5E1DA0A6CBC79 /* AudioView.swift in Sources */,
+				723D8E8B1002FAB0B0C0C63C /* CameraView.swift in Sources */,
+				C2C6AAA7EDA8CA7A6793A059 /* Components.swift in Sources */,
+				0777281EFC3E3C2A477FD064 /* ContentView.swift in Sources */,
+				92BD2E8295F7BE5A89307D47 /* ConvertView.swift in Sources */,
+				F1A8CBC58BED1460D21FFCAE /* DecryptView.swift in Sources */,
+				CA695A85FED07038282098E8 /* DesignTokens.swift in Sources */,
+				E2A85D92FC39076E8D82F125 /* HomeView.swift in Sources */,
+				7A6E396A4B3F95E0A7FD7B03 /* LibraryView.swift in Sources */,
+				6174ED7BF4792CA37BFE9F54 /* ProfileView.swift in Sources */,
+				46BEA1C821B6052FF176045A /* QTSQApp.swift in Sources */,
+				BA538F3BD86C870779909B35 /* QtsqEngine.swift in Sources */,
+				C7F283460D959AB32628609A /* ViewerView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		52A386FE63D0AEA0732F89D5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"lib\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/../include",
+				);
+				INFOPLIST_FILE = QTSQ/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "QTSQ needs camera access to capture photos directly into .qtsq format.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "QTSQ needs microphone access to record audio directly into .qtsq format.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lz",
+					"-framework Metal",
+					"-framework MetalPerformanceShaders",
+					"-framework CoreGraphics",
+					"-framework AVFoundation",
+					"-framework AudioToolbox",
+					"-framework CoreAudio",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.haruhito.qtsq;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "QTSQ/QTSQ-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5B6005EC4AA1FAD99E177E95 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		C4A27064DB0C4E4EED3E66B5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"lib\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/../include",
+				);
+				INFOPLIST_FILE = QTSQ/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "QTSQ needs camera access to capture photos directly into .qtsq format.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "QTSQ needs microphone access to record audio directly into .qtsq format.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lz",
+					"-framework Metal",
+					"-framework MetalPerformanceShaders",
+					"-framework CoreGraphics",
+					"-framework AVFoundation",
+					"-framework AudioToolbox",
+					"-framework CoreAudio",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.haruhito.qtsq;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "QTSQ/QTSQ-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		F55BB5C5D889CF0C1788F5AA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		46360D67AAD784BB429CACA6 /* Build configuration list for PBXNativeTarget "QTSQ" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				52A386FE63D0AEA0732F89D5 /* Debug */,
+				C4A27064DB0C4E4EED3E66B5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F50C60243AEB6D398C9E0BA8 /* Build configuration list for PBXProject "QTSQ" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F55BB5C5D889CF0C1788F5AA /* Debug */,
+				5B6005EC4AA1FAD99E177E95 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D57AFD6E561834853C4667E7 /* Project object */;
+}

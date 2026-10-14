@@ -1,0 +1,120 @@
+#version 450
+
+precision highp float;
+precision highp int;
+
+/*
+ * QTSQ GPU Triangle Rasterization Shader
+ * 
+ * Face-centric scatter: each invocation handles one triangle.
+ * Simple float barycentric — no special-case handling.
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer OutputBuf {
+    uint output_pixels[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VertexBuf {
+    float vertex_data[];
+};
+
+layout(set = 0, binding = 2) readonly buffer FaceBuf {
+    uint face_indices[];
+};
+
+layout(set = 0, binding = 3) readonly buffer BBoxBuf {
+    uvec2 face_bbox[];
+};
+
+layout(set = 0, binding = 4) buffer BlurMapBuf {
+    uint blur_map[];
+};
+
+layout(set = 0, binding = 5) readonly buffer TierMaskBuf {
+    uint tier_mask[];
+};
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint num_faces;
+    uint num_verts;
+    uint channels;
+    uint has_tier_mask;
+};
+
+void main() {
+    uint fi = gl_GlobalInvocationID.x;
+    if (fi >= num_faces) return;
+    
+    uvec2 bb = face_bbox[fi];
+    uint bbminx = bb.x & 0xFFFFu;
+    uint bbminy = bb.x >> 16u;
+    uint bbmaxx = bb.y & 0xFFFFu;
+    uint bbmaxy = bb.y >> 16u;
+    
+    if (bbminx >= width) bbminx = width - 1u;
+    if (bbminy >= height) bbminy = height - 1u;
+    if (bbmaxx >= width) bbmaxx = width - 1u;
+    if (bbmaxy >= height) bbmaxy = height - 1u;
+    if (bbminx > bbmaxx || bbminy > bbmaxy) return;
+    
+    uint i0 = face_indices[fi];
+    uint i1 = face_indices[num_faces + fi];
+    uint i2 = face_indices[num_faces * 2u + fi];
+    
+    float x0 = vertex_data[i0 * 3u];
+    float y0 = vertex_data[i0 * 3u + 1u];
+    float x1 = vertex_data[i1 * 3u];
+    float y1 = vertex_data[i1 * 3u + 1u];
+    float x2 = vertex_data[i2 * 3u];
+    float y2 = vertex_data[i2 * 3u + 1u];
+    
+    float d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+    if (abs(d) < 1e-6) return;
+    float inv_d = 1.0 / d;
+    
+    uint rgb0 = floatBitsToUint(vertex_data[i0 * 3u + 2u]);
+    uint rgb1 = floatBitsToUint(vertex_data[i1 * 3u + 2u]);
+    uint rgb2 = floatBitsToUint(vertex_data[i2 * 3u + 2u]);
+    
+    float r0 = float(rgb0 & 0xFFu), g0 = float((rgb0 >> 8u) & 0xFFu), b0 = float((rgb0 >> 16u) & 0xFFu);
+    float r1 = float(rgb1 & 0xFFu), g1 = float((rgb1 >> 8u) & 0xFFu), b1 = float((rgb1 >> 16u) & 0xFFu);
+    float r2 = float(rgb2 & 0xFFu), g2 = float((rgb2 >> 8u) & 0xFFu), b2 = float((rgb2 >> 16u) & 0xFFu);
+    
+    float area = 0.5 * abs(x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1));
+    uint blur_passes = 0u;
+    if (area > 200.0) blur_passes = 2u;
+    else if (area > 50.0) blur_passes = 1u;
+    
+    for (uint py = bbminy; py <= bbmaxy; py++) {
+        for (uint px = bbminx; px <= bbmaxx; px++) {
+            float fpx = float(px) + 0.5;
+            float fpy = float(py) + 0.5;
+            
+            float u = ((y1 - y2) * (fpx - x2) + (x2 - x1) * (fpy - y2)) * inv_d;
+            float v = ((y2 - y0) * (fpx - x2) + (x0 - x2) * (fpy - y2)) * inv_d;
+            float w = 1.0 - u - v;
+            
+            if (u >= -0.001 && v >= -0.001 && w >= -0.001) {
+                u = max(u, 0.0); v = max(v, 0.0); w = max(w, 0.0);
+                float sum = u + v + w;
+                if (sum > 0.0) { u /= sum; v /= sum; w /= sum; }
+                
+                float out_r = u * r0 + v * r1 + w * r2;
+                float out_g = u * g0 + v * g1 + w * g2;
+                float out_b = u * b0 + v * b1 + w * b2;
+                
+                uint r = clamp(uint(out_r + 0.5), 0u, 255u);
+                uint g = clamp(uint(out_g + 0.5), 0u, 255u);
+                uint b = clamp(uint(out_b + 0.5), 0u, 255u);
+                
+                uint idx = py * width + px;
+                output_pixels[idx] = r | (g << 8u) | (b << 16u) | (0xFFu << 24u);
+                blur_map[idx] = blur_passes;
+            }
+        }
+    }
+}

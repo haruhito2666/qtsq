@@ -1,0 +1,128 @@
+# Quantum Tensor Sequence Proprietary License (QTSPL) v1.0
+
+**Copyright (c) 2026 Haruhito. All Rights Reserved.**
+
+---
+
+## 1. Definitions
+
+- **"Software"** refers to the Quantum Tensor Sequence (.qtsq) file format specification, all associated source code, libraries, tools, documentation, algorithms, and data structures contained in this repository.
+- **"Author"** refers to Haruhito, the sole copyright holder.
+- **"Format"** refers to the .qtsq (Quantum Tensor Sequence) and .qtsw (Event Wave) binary file formats.
+- **"Marks"** refers to the names "Quantum Tensor Sequence", ".qtsq", ".qtsw", "Spaghettification Engine", "Cosmic Censorship", "Hawking Radiation", "Gravitational Waves", and all associated branding, logos, and terminology.
+
+---
+
+## 2. Grant of Rights
+
+You are granted a limited, non-exclusive, non-transferable, revocable license to use the Software strictly for **free non-commercial personal, educational (school), and academic research purposes**, subject to the conditions set forth in this license.
+
+All other rights, including commercial use, distribution, and modification, are strictly reserved by the Author.
+
+---
+
+## 3. Restrictions
+
+Except for the permitted uses expressly granted in Section 2, you may **NOT**, without prior written authorization from the Author:
+
+### 3.1 Commercial and Unauthorized Use
+- Use the Software, in whole or in part, for any commercial, corporate, or for-profit purpose.
+- Incorporate any portion of the Software into any commercial software, product, or service.
+- Use the Format to read, write, create, or process .qtsq or .qtsw files for any commercial purpose.
+
+### 3.2 Modify
+- Modify, adapt, translate, reverse engineer, decompile, disassemble, or create derivative works based on the Software.
+- Alter the Format specification in any way.
+
+### 3.3 Distribute
+- Copy, distribute, publish, sublicense, sell, lease, rent, or otherwise transfer the Software or any portion thereof.
+- Share, upload, or make the Software available through any medium, including but not limited to code repositories, file sharing services, or electronic communication.
+
+### 3.4 Compete
+- Develop, produce, market, or distribute any software, tool, library, or service that reads, writes, processes, or is compatible with the .qtsq or .qtsw file formats.
+- Create any file format, specification, or standard that is substantially similar to or derived from the Format.
+
+### 3.5 Brand
+- Use any of the Marks in any product name, service name, domain name, social media account, marketing material, or any other context.
+- Register any trademark, domain name, or intellectual property that contains or is confusingly similar to any of the Marks.
+- Imply any endorsement, affiliation, or association with the Author without written consent.
+
+---
+
+## 4. Attribution and Credits
+
+For the permitted free uses defined in Section 2, the following attribution rules apply:
+
+- **Academic & Research Use:** If the Software or Format is used in any published academic, scientific, or institutional research, you **MUST** provide appropriate credit and citation to the Author (Haruhito) and the Quantum Tensor Sequence project.
+- **Personal & Educational (School) Use:** Adding credits is **optional but highly appreciated**. If you use this for a school project or personal hobby, mentioning the Quantum Tensor Sequence project is a great way to show support.
+
+---
+
+## 5. Research Paper
+
+The research paper titled "Quantum Tensor Sequence: A Universal Data Compression Format with Physics-Inspired Architecture, Zero-Knowledge Verification, and Self-Healing Recovery" is published for informational and academic reference purposes only. Publication of the paper does **not** constitute a grant of any license, right, or permission to use, implement, or reproduce the Software, Format, or any techniques described therein.
+
+---
+
+## 6. Licensing Inquiries
+
+To obtain a license for commercial use or any use outside the scope of Section 2, contact the Author directly. Licensing terms, fees, and conditions are determined solely at the Author's discretion.
+
+---
+
+## 7. Intellectual Property
+
+The Software, Format, Marks, and all associated intellectual property are the exclusive property of the Author. This includes but is not limited to:
+
+- The .qtsq and .qtsw binary file format specifications
+- The five-layer gravitational compression architecture
+- The Spaghettification Engine (automatic data type detection and strategy selection)
+- The Cosmic Censorship dual-layer security system (AES-256-GCM + Schnorr ZKP)
+- The Wormhole inter-file linking system
+- The Gravitational Wave differential update system
+- The Redshift/Blueshift multi-resolution quality scaling system
+- The Chandrasekhar Limit adaptive threshold system
+- The Information Paradox error correction and recovery system
+- All source code, documentation, and related materials
+
+---
+
+## 8. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+---
+
+## 9. Limitation of Liability
+
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+## 10. Termination
+
+Any unauthorized use of the Software, Format, or Marks automatically terminates the permissions granted herein and may result in legal action. The Author reserves the right to pursue all available legal remedies for any violation of this license.
+
+---
+
+## 11. Governing Law
+
+This license shall be governed by and construed in accordance with the laws of India. Any disputes arising under this license shall be subject to the exclusive jurisdiction of the courts in India.
+
+---
+
+## 12. Severability
+
+If any provision of this license is held to be unenforceable or invalid, that provision shall be modified to the minimum extent necessary to make it enforceable, and all remaining provisions shall continue in full force and effect.
+
+---
+
+## 13. Entire Agreement
+
+This license constitutes the entire agreement between the parties regarding the Software and supersedes all prior agreements, understandings, and communications, whether written or oral.
+
+---
+
+**Quantum Tensor Sequence Proprietary License (QTSPL) v1.0**
+**Effective Date: March 2026**
+**Copyright (c) 2026 Haruhito. All Rights Reserved.**

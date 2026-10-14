@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QTSQ Viewer</title>
+    <!-- We need to adjust import paths in qtsq-viewer.js for the extension, but here we can just load it -->
+    <script type="module" src="qtsq-viewer.js"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            background: #111;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            font-family: system-ui, sans-serif;
+            color: white;
+        }
+        qtsq-viewer {
+            width: 100%;
+            height: 100%;
+            --qtsq-bg: transparent;
+            --qtsq-radius: 0;
+        }
+        .header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 1rem;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: space-between;
+            z-index: 10;
+        }
+        .url { font-family: monospace; opacity: 0.8; }
+    </style>
+</head>
+<body>
+    <div class="header" id="header" style="display:none;">
+        <span class="url" id="urlDisplay"></span>
+        <a href="#" id="downloadBtn" style="color:#3b82f6; text-decoration:none;">Save As...</a>
+    </div>
+    
+    <qtsq-viewer id="viewer" theme="dark"></qtsq-viewer>
+
+    <script type="module">
+        const params = new URLSearchParams(window.location.search);
+        const fileUrl = params.get('url');
+        
+        if (fileUrl) {
+            document.title = fileUrl.split('/').pop() || 'QTSQ File';
+            document.getElementById('header').style.display = 'flex';
+            document.getElementById('urlDisplay').textContent = fileUrl;
+            
+            const viewer = document.getElementById('viewer');
+            viewer.setAttribute('src', fileUrl);
+
+            document.getElementById('downloadBtn').onclick = (e) => {
+                e.preventDefault();
+                chrome.downloads.download({
+                    url: fileUrl,
+                    filename: document.title
+                });
+            };
+        } else {
+            document.body.innerHTML = '<h2>No QTSQ URL provided</h2>';
+        }
+    </script>
+</body>
+</html>

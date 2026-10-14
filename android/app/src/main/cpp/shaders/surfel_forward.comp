@@ -1,0 +1,210 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer SurfelBuf {
+    float surfels[];   // surfel_t: center[3], quat[4], log_su, log_sv, opacity_logit, color[3] = 13 floats
+};
+
+layout(std430, binding = 1) writeonly buffer PredBuf {
+    vec3 pred_image[];  // W*H vec3 RGB
+};
+
+layout(std430, binding = 2) readonly buffer TargetBuf {
+    vec3 target_image[]; // W*H vec3 RGB (unused by this shader; bound for symmetry)
+};
+
+// Phase E deferred outputs (consumed by the loss shader / HUD):
+layout(std430, binding = 3) writeonly buffer DepthBuf {
+    float depth_image[];  // W*H unbiased surface depth (0 = empty)
+};
+
+layout(std430, binding = 4) writeonly buffer NormalBuf {
+    vec3 normal_image[];  // W*H*3 camera-facing accumulated normal
+};
+
+layout(std430, binding = 5) writeonly buffer AlphaBuf {
+    float alpha_image[];  // W*H accumulated opacity 1-T
+};
+
+layout(push_constant) uniform PC {
+    vec4 cam_pos;      // xyz = pos, w = unused
+    vec4 cam_right;    // xyz = right, w = unused
+    vec4 cam_up;       // xyz = up, w = unused
+    vec4 cam_forward;  // xyz = forward, w = unused
+    vec4 intrinsics;   // fx, fy, cx, cy
+    uvec4 dims;        // W, H, num_surfels, unused
+} pc;
+
+#define SURFEL_STRIDE 13
+#define MAX_HITS 256
+#define ALPHA_CLAMP 0.99
+#define T_EPS 1e-4
+#define G_EPS 1e-3
+#define LOWPASS_SIGMA 0.70710678
+#define O_THRESH 0.6
+#define O_EPS 0.1
+
+// Per-pixel intersection record — fields mirror prototype hit_t.
+struct Hit {
+    int   idx;      // surfel index
+    float depth;    // camera-space depth of the hit
+    float alpha;    // opacity * G (clamped)
+    float G;        // effective weight = max(Gn, Glp)
+    float u, v;     // local tangent coords
+    int   lowpass;  // 1 if screen low-pass floor dominated
+};
+
+// Insertion sort, ascending depth (front-to-back) — matches host
+// surfel_gather_pixel (qsort on depth).
+void sortHits(inout Hit hits[256], int m) {
+    for (int i = 1; i < m; i++) {
+        Hit key = hits[i];
+        int j = i - 1;
+        while (j >= 0 && hits[j].depth > key.depth) {
+            hits[j + 1] = hits[j];
+            j--;
+        }
+        hits[j + 1] = key;
+    }
+}
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+    if (px >= pc.dims.x || py >= pc.dims.y) return;
+
+    uint pix = py * pc.dims.x + px;
+    uint ns = pc.dims.z;
+
+    vec3 O = pc.cam_pos.xyz;
+    vec3 right = pc.cam_right.xyz;
+    vec3 up = pc.cam_up.xyz;
+    vec3 fwd = pc.cam_forward.xyz;
+    float fx = pc.intrinsics.x;
+    float fy = pc.intrinsics.y;
+    float cx = pc.intrinsics.z;
+    float cy = pc.intrinsics.w;
+
+    // Ray direction through pixel centre
+    float ndx = (float(px) + 0.5 - cx) / fx;
+    float ndy = (float(py) + 0.5 - cy) / fy;
+    vec3 d = normalize(fwd + ndx * right + ndy * up);
+
+    // Gather hits (identical acceptance criteria to the backward shader and
+    // to the host surfel_gather_pixel).
+    Hit hits[256];
+    int m = 0;
+
+    for (uint i = 0; i < ns && m < MAX_HITS; i++) {
+        uint base = i * SURFEL_STRIDE;
+        vec3 center = vec3(surfels[base], surfels[base+1], surfels[base+2]);
+        vec4 quat = normalize(vec4(surfels[base+3], surfels[base+4], surfels[base+5], surfels[base+6]));
+        float log_su = surfels[base+7];
+        float log_sv = surfels[base+8];
+        float opacity_logit = surfels[base+9];
+
+        float wq = quat.x, qx = quat.y, qy = quat.z, qz = quat.w;
+        float qx2 = qx*qx, qy2 = qy*qy, qz2 = qz*qz;
+        float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz;
+        float qwx = wq*qx, qwy = wq*qy, qwz = wq*qz;
+        vec3 tu = vec3(1 - 2*(qy2+qz2), 2*(qxy+qwz), 2*(qxz-qwy));
+        vec3 tv = vec3(2*(qxy-qwz), 1 - 2*(qx2+qz2), 2*(qyz+qwx));
+        vec3 nrm = vec3(2*(qxz+qwy), 2*(qyz-qwx), 1 - 2*(qx2+qy2));
+
+        float denom = dot(d, nrm);
+        if (abs(denom) < 1e-6) continue;
+        float t = dot(center - O, nrm) / denom;
+        if (t <= 1e-4) continue;
+
+        vec3 hitp = O + t * d;
+        vec3 dp = hitp - center;
+        float su = exp(log_su);
+        float sv = exp(log_sv);
+        float u_val = dot(dp, tu) / su;
+        float v_val = dot(dp, tv) / sv;
+        float G = exp(-0.5 * (u_val*u_val + v_val*v_val));
+        float depth = dot(hitp - O, fwd);
+        if (depth <= 0.0) continue;
+
+        // Screen-space low-pass floor (2DGS Eq. 11)
+        int lowpass = 0;
+        vec3 rel = center - O;
+        float zc = dot(rel, fwd);
+        if (zc > 1e-6) {
+            float sx = cx + fx * dot(rel, right) / zc;
+            float sy = cy + fy * dot(rel, up) / zc;
+            float ddx = (float(px) + 0.5) - sx;
+            float ddy = (float(py) + 0.5) - sy;
+            float pd2 = ddx*ddx + ddy*ddy;
+            float Glp = exp(-0.5 * pd2 / (LOWPASS_SIGMA * LOWPASS_SIGMA));
+            if (Glp > G) { G = Glp; lowpass = 1; }
+        }
+
+        if (G < G_EPS) continue;
+
+        float sig = 1.0 / (1.0 + exp(-opacity_logit));
+        float alpha = sig * G;
+        if (alpha > ALPHA_CLAMP) alpha = ALPHA_CLAMP;
+
+        hits[m].idx = int(i);
+        hits[m].depth = depth;
+        hits[m].alpha = alpha;
+        hits[m].G = G;
+        hits[m].u = u_val;
+        hits[m].v = v_val;
+        hits[m].lowpass = lowpass;
+        m++;
+    }
+
+    pred_image[pix] = vec3(0.0);
+    depth_image[pix] = 0.0;
+    normal_image[pix] = vec3(0.0);
+    alpha_image[pix] = 0.0;
+
+    if (m == 0) return;
+
+    // Depth-sort front-to-back, then alpha-composite (2DGS Eq. 12) + the
+    // Phase E deferred outputs (unbiased depth, normal map, opacity).
+    sortHits(hits, m);
+
+    vec3 acc = vec3(0.0);
+    vec3 nrm_acc = vec3(0.0);
+    float T = 1.0;
+    float cumO = 0.0;   // cumulative opacity (Yang et al. 2025 Eq. 9)
+    float surf_depth = 0.0;
+    int depth_set = 0;
+
+    for (int k = 0; k < m; k++) {
+        uint base = uint(hits[k].idx) * SURFEL_STRIDE;
+        vec3 color = vec3(surfels[base+10], surfels[base+11], surfels[base+12]);
+        float w_blend = hits[k].alpha * T;
+        acc += w_blend * color;
+
+        // camera-facing normal: flip the frame normal toward the camera
+        vec4 quat = normalize(vec4(surfels[base+3], surfels[base+4], surfels[base+5], surfels[base+6]));
+        float wq = quat.x, qx = quat.y, qy = quat.z, qz = quat.w;
+        float qx2 = qx*qx, qy2 = qy*qy, qz2 = qz*qz;
+        float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz;
+        float qwx = wq*qx, qwy = wq*qy, qwz = wq*qz;
+        vec3 nrm = vec3(2*(qxz+qwy), 2*(qyz-qwx), 1 - 2*(qx2+qy2));
+        float sfx = (dot(nrm, fwd) > 0.0) ? -1.0 : 1.0;
+        nrm_acc += w_blend * (nrm * sfx);
+
+        // Unbiased depth (Yang et al. 2025 Eq. 9)
+        cumO += (hits[k].alpha + O_EPS) * hits[k].G;
+        if (depth_set == 0 && cumO >= O_THRESH) {
+            surf_depth = hits[k].depth;
+            depth_set = 1;
+        }
+
+        T *= (1.0 - hits[k].alpha);
+        if (T < T_EPS) break;
+    }
+    if (depth_set == 0 && m > 0) surf_depth = hits[m-1].depth;
+
+    pred_image[pix] = acc;
+    depth_image[pix] = surf_depth;
+    alpha_image[pix] = 1.0 - T;
+    float nl = length(nrm_acc);
+    if (nl > 1e-12) normal_image[pix] = nrm_acc / nl;
+}

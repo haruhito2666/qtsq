@@ -1,0 +1,122 @@
+#version 450
+
+/*
+ * QTSQ GPU Gaussian Splat Renderer
+ *
+ * Each GPU thread handles one pixel. For each pixel, evaluate
+ * all splats whose bounding box includes this pixel, compute
+ * Gaussian weights, and alpha-blend onto the base image.
+ *
+ * This replaces the CPU splat2d_render function.
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+/* Base RGB image (read/write) — already rasterized triangles */
+layout(set = 0, binding = 0) buffer ImageBuf {
+    uint image_pixels[];  /* packed RGBA per pixel */
+};
+
+/* Splat buffer: packed splat data
+ * Per splat: x(u16), y(u16), sx(u8), sy(u8), theta(u8), r(u8), g(u8), b(u8), alpha(u8), pad(u8)
+ * = 12 bytes per splat, packed as 3 × uint32 */
+layout(set = 0, binding = 1) readonly buffer SplatBuf {
+    uvec4 splat_data[];  /* 16 bytes per splat for alignment */
+};
+
+/* Foreground mask: pixels to skip (1 = foreground, skip) */
+layout(set = 0, binding = 2) readonly buffer FgMaskBuf {
+    uint fg_mask_packed[];  /* 4 pixels per uint */
+};
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint num_splats;
+    uint has_fg_mask;
+};
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+
+    if (px >= width || py >= height) return;
+
+    uint idx = py * width + px;
+    
+    /* Check foreground mask */
+    if (has_fg_mask != 0u) {
+        uint mask_word = fg_mask_packed[idx / 4u];
+        uint mask_byte = (mask_word >> ((idx % 4u) * 8u)) & 0xFFu;
+        if (mask_byte != 0u) return;  /* skip foreground pixel */
+    }
+
+    /* Read current pixel color */
+    uint cur = image_pixels[idx];
+    float cr = float(cur & 0xFFu);
+    float cg = float((cur >> 8u) & 0xFFu);
+    float cb = float((cur >> 16u) & 0xFFu);
+
+    float fpx = float(px);
+    float fpy = float(py);
+
+    /* Accumulate splat contributions */
+    for (uint s = 0u; s < num_splats; s++) {
+        uvec4 sd = splat_data[s];
+        
+        /* Unpack splat */
+        uint sx_pos = sd.x & 0xFFFFu;
+        uint sy_pos = sd.x >> 16u;
+        uint scale_x = sd.y & 0xFFu;
+        uint scale_y = (sd.y >> 8u) & 0xFFu;
+        uint theta_q = (sd.y >> 16u) & 0xFFu;
+        uint alpha_q = (sd.y >> 24u) & 0xFFu;
+        uint sr = sd.z & 0xFFu;
+        uint sg = (sd.z >> 8u) & 0xFFu;
+        uint sb = (sd.z >> 16u) & 0xFFu;
+        
+        if (alpha_q == 0u) continue;
+        if (scale_x == 0u) scale_x = 1u;
+        if (scale_y == 0u) scale_y = 1u;
+        
+        /* Quick bounding box reject — use 4x sigma for wider Gaussians */
+        float fsx = float(scale_x) * 2.0;  /* 2x wider for seamless overlap */
+        float fsy = float(scale_y) * 2.0;
+        float max_sigma = max(fsx, fsy);
+        float radius = max_sigma * 3.0;
+        
+        float dx = fpx - float(sx_pos);
+        float dy = fpy - float(sy_pos);
+        
+        if (abs(dx) > radius || abs(dy) > radius) continue;
+
+        /* Rotate coordinates */
+        float theta = float(theta_q) * (3.14159265 / 255.0);
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float lx = dx * cos_t + dy * sin_t;
+        float ly = -dx * sin_t + dy * cos_t;
+
+        /* Gaussian evaluation */
+        float inv_sx2 = 1.0 / (fsx * fsx);
+        float inv_sy2 = 1.0 / (fsy * fsy);
+        float exponent = -0.5 * (lx * lx * inv_sx2 + ly * ly * inv_sy2);
+        
+        if (exponent < -4.5) continue;
+        
+        /* Slightly dampen alpha to soften overlap — 0.85 keeps coverage strong */
+        float alpha_f = float(alpha_q) / 255.0 * 0.85;
+        float weight = alpha_f * exp(exponent);
+        float inv_w = 1.0 - weight;
+        
+        cr = cr * inv_w + float(sr) * weight;
+        cg = cg * inv_w + float(sg) * weight;
+        cb = cb * inv_w + float(sb) * weight;
+    }
+
+    /* Write final pixel */
+    uint out_r = clamp(uint(cr + 0.5), 0u, 255u);
+    uint out_g = clamp(uint(cg + 0.5), 0u, 255u);
+    uint out_b = clamp(uint(cb + 0.5), 0u, 255u);
+    image_pixels[idx] = out_r | (out_g << 8u) | (out_b << 16u) | (0xFFu << 24u);
+}

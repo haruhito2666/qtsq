@@ -1,0 +1,25 @@
+{
+  "name": "@qtsq/decoder",
+  "version": "1.0.0",
+  "description": "WASM decoder for Quantum Tensor Sequence (.qtsq) files",
+  "main": "src/qtsq-decoder.js",
+  "type": "module",
+  "scripts": {
+    "build": "mkdir -p build && cd build && emcmake cmake .. && emmake make",
+    "test": "node test/test.js"
+  },
+  "keywords": [
+    "qtsq",
+    "decoder",
+    "wasm",
+    "image",
+    "compression"
+  ],
+  "author": "Haruhito",
+  "license": "MIT",
+  "files": [
+    "src/",
+    "qtsq-decoder.wasm",
+    "qtsq-decoder.js"
+  ]
+}

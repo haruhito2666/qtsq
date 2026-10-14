@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtsq"
+version = "2.2.0"
+description = "Read, write, compress, and decompress .qtsq files — images, text, tensors, and AI brain states."
+readme = "README.md"
+authors = [{name = "haruhito"}]
+license = "LicenseRef-Proprietary"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0.0",
+    "torch-geometric>=2.4.0",
+    "safetensors>=0.4.0",
+    "ml_dtypes>=0.2.0",
+]
+images = [
+    "Pillow>=9.0.0",
+]
+checkpoint = [
+    "torch>=2.0.0",
+    "safetensors>=0.4.0",
+    "onnx>=1.14.0",
+]
+hub = [
+    "huggingface_hub>=0.20.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["qtsq*"]

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="sharedpref" path="."/>
+        <exclude domain="sharedpref" path="device.xml"/>
+        <!-- QTSQ privacy: device keypair + captured media never leave the device -->
+        <exclude domain="file" path="qtsq"/>
+        <exclude domain="file" path=".qtsq"/>
+        <exclude domain="file" path="captures"/>
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="."/>
+        <exclude domain="sharedpref" path="device.xml"/>
+        <!-- Keystore-wrapped key material is useless on a new device; exclude it -->
+        <exclude domain="file" path="qtsq"/>
+        <exclude domain="file" path=".qtsq"/>
+    </device-transfer>
+</data-extraction-rules>

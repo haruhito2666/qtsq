@@ -1,0 +1,137 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer SurfelBuf {
+    float surfels[];
+};
+
+layout(std430, binding = 1) buffer GradBuf {
+    uint grads[];
+};
+
+layout(std430, binding = 2) buffer AdamMBuf {
+    float adam_m[];
+};
+
+layout(std430, binding = 3) buffer AdamVBuf {
+    float adam_v[];
+};
+
+layout(push_constant) uniform PC {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float bc1;
+    float bc2;
+    uint num_surfels;
+    uint step;
+} pc;
+
+#define SURFEL_STRIDE 13
+#define GRAD_STRIDE 12
+
+#define LR_CENTER   1.0
+#define LR_SCALE    1.0
+#define LR_OPACITY  1.5
+#define LR_COLOR    1.5
+#define LR_ROT      1.0
+
+float adam_update(float g, uint m_idx, uint v_idx, float lr_val) {
+    float m_val = adam_m[m_idx];
+    float v_val = adam_v[v_idx];
+    m_val = pc.beta1 * m_val + (1.0 - pc.beta1) * g;
+    v_val = pc.beta2 * v_val + (1.0 - pc.beta2) * g * g;
+    adam_m[m_idx] = m_val;
+    adam_v[v_idx] = v_val;
+    float mh = m_val / pc.bc1;
+    float vh = v_val / pc.bc2;
+    return lr_val * mh / (sqrt(vh) + pc.eps);
+}
+
+float read_grad_zero(uint idx) {
+    uint gv = atomicExchange(grads[idx], 0u);
+    return uintBitsToFloat(gv);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_surfels) return;
+
+    uint sbase = i * SURFEL_STRIDE;
+    uint gbase = i * GRAD_STRIDE;
+
+    float base_lr = pc.lr;
+
+    // Center
+    for (int j = 0; j < 3; j++) {
+        float g = read_grad_zero(gbase + j);
+        surfels[sbase + j] -= adam_update(g, gbase + j, gbase + j, base_lr * LR_CENTER);
+    }
+
+    // Log scale
+    {
+        float g = read_grad_zero(gbase + 3);
+        surfels[sbase + 7] -= adam_update(g, gbase + 3, gbase + 3, base_lr * LR_SCALE);
+        surfels[sbase + 7] = clamp(surfels[sbase + 7], -6.0, 2.0);
+    }
+    {
+        float g = read_grad_zero(gbase + 4);
+        surfels[sbase + 8] -= adam_update(g, gbase + 4, gbase + 4, base_lr * LR_SCALE);
+        surfels[sbase + 8] = clamp(surfels[sbase + 8], -6.0, 2.0);
+    }
+
+    // Opacity
+    {
+        float g = read_grad_zero(gbase + 5);
+        surfels[sbase + 9] -= adam_update(g, gbase + 5, gbase + 5, base_lr * LR_OPACITY);
+    }
+
+    // Color
+    for (int j = 0; j < 3; j++) {
+        float g = read_grad_zero(gbase + 6 + j);
+        surfels[sbase + 10 + j] -= adam_update(g, gbase + 6 + j, gbase + 6 + j, base_lr * LR_COLOR);
+        surfels[sbase + 10 + j] = clamp(surfels[sbase + 10 + j], 0.0, 1.0);
+    }
+
+    // Rotation: Adam-smooth torque -> small-angle quaternion -> multiply
+    float gx = read_grad_zero(gbase + 9);
+    float gy = read_grad_zero(gbase + 10);
+    float gz = read_grad_zero(gbase + 11);
+
+    float dx = adam_update(gx, gbase + 9, gbase + 9, base_lr * LR_ROT);
+    float dy = adam_update(gy, gbase + 10, gbase + 10, base_lr * LR_ROT);
+    float dz = adam_update(gz, gbase + 11, gbase + 11, base_lr * LR_ROT);
+
+    // Negate (descent)
+    float nx = -dx, ny = -dy, nz = -dz;
+    float ang = sqrt(nx*nx + ny*ny + nz*nz);
+
+    vec4 dq;
+    if (ang < 1e-9) {
+        dq = vec4(1.0, 0.5 * nx, 0.5 * ny, 0.5 * nz);
+    } else {
+        float h = 0.5 * ang;
+        float s = sin(h) / ang;
+        dq = vec4(cos(h), s * nx, s * ny, s * nz);
+    }
+
+    // Current quaternion [w,x,y,z]
+    vec4 q = vec4(surfels[sbase + 3], surfels[sbase + 4],
+                  surfels[sbase + 5], surfels[sbase + 6]);
+
+    // dq * q
+    vec4 nq;
+    nq.x = dq.x*q.x - dq.y*q.y - dq.z*q.z - dq.w*q.w;
+    nq.y = dq.x*q.y + dq.y*q.x + dq.z*q.w - dq.w*q.z;
+    nq.z = dq.x*q.z - dq.y*q.w + dq.z*q.x + dq.w*q.y;
+    nq.w = dq.x*q.w + dq.y*q.z - dq.z*q.y + dq.w*q.x;
+
+    float nrm = length(nq);
+    if (nrm > 1e-20) nq /= nrm;
+
+    surfels[sbase + 3] = nq.x;
+    surfels[sbase + 4] = nq.y;
+    surfels[sbase + 5] = nq.z;
+    surfels[sbase + 6] = nq.w;
+}

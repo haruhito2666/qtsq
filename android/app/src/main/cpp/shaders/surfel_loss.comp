@@ -1,0 +1,172 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer PredBuf {
+    vec3 pred_image[];
+};
+
+layout(std430, binding = 1) readonly buffer TargetBuf {
+    vec3 target_image[];
+};
+
+layout(std430, binding = 2) writeonly buffer DlDpredBuf {
+    vec3 dL_dpred[];
+};
+
+layout(std430, binding = 3) buffer LossBuf {
+    uint total_loss;  // uint bit-pattern for atomic CAS float add
+};
+
+// Phase E inputs (from the extended forward):
+layout(std430, binding = 4) readonly buffer DepthBuf {
+    float depth_image[];
+};
+
+layout(std430, binding = 5) readonly buffer NormalBuf {
+    vec3 normal_image[];
+};
+
+layout(std430, binding = 6) readonly buffer AlphaBuf {
+    float alpha_image[];
+};
+
+// Phase E output (consumed by the backward shader): one buffer holding
+// depth_grad[W*H] followed by normal_grad[W*H*3].
+layout(std430, binding = 7) buffer NcGradBuf {
+    float nc_grad[];
+};
+
+layout(push_constant) uniform PC {
+    uvec4 dims;   // W, H, unused, unused
+    vec4 lam;     // x = lam_n (normal-consistency weight)
+} pc;
+
+#define O_THRESH 0.6
+#define O_EPS    0.1
+
+void atomicAddFloat(uint idx, float v) {
+    uint old = total_loss;
+    uint assumed;
+    do {
+        assumed = old;
+        uint next = floatBitsToUint(uintBitsToFloat(assumed) + v);
+        old = atomicCompSwap(total_loss, assumed, next);
+    } while (old != assumed);
+}
+
+// NC helpers: N(g) with g = (−dzx,−dzy,1); dL/dg and the depth stencil.
+void ncTerm(vec3 nhat, float dzx, float dzy,
+            out vec3 dl_dN, out float dl_dgx, out float dl_dgy) {
+    vec3 g = vec3(-dzx, -dzy, 1.0);
+    float gl = length(g);
+    if (gl < 1e-12) { dl_dN = vec3(0.0); dl_dgx = 0.0; dl_dgy = 0.0; return; }
+    vec3 N = g / gl;
+    float nd = dot(nhat, N);
+    float sgn = (nd > 0.0) ? 1.0 : (nd < 0.0 ? -1.0 : 0.0);
+    if (sgn == 0.0) { dl_dN = vec3(0.0); dl_dgx = 0.0; dl_dgy = 0.0; return; }
+    /* ∂L/∂n̂ = −sgn·N ; ∂L/∂N = −sgn·n̂ ; ∂N/∂g = (I − NNᵀ)/|g| */
+    dl_dN = -sgn * N;
+    float nNg = dot(N, -sgn * nhat);
+    dl_dgx = (-sgn * nhat.x - nNg * N.x) / gl;
+    dl_dgy = (-sgn * nhat.y - nNg * N.y) / gl;
+}
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+    if (px >= pc.dims.x || py >= pc.dims.y) return;
+
+    uint pix = py * pc.dims.x + px;
+    uint N = pc.dims.x * pc.dims.y;
+    float invN = 1.0 / float(N * 3);
+    float lam_n = pc.lam.x;
+
+    vec3 pred = pred_image[pix];
+    vec3 target = target_image[pix];
+    vec3 diff = pred - target;
+
+    vec3 grad = vec3(
+        diff.x > 0.0 ? invN : (diff.x < 0.0 ? -invN : 0.0),
+        diff.y > 0.0 ? invN : (diff.y < 0.0 ? -invN : 0.0),
+        diff.z > 0.0 ? invN : (diff.z < 0.0 ? -invN : 0.0)
+    );
+
+    dL_dpred[pix] = grad;
+
+    float l1 = (abs(diff.x) + abs(diff.y) + abs(diff.z)) * invN;
+    atomicAddFloat(0, l1);
+
+    /* ── Phase E: normal-consistency (mean over pixels, λn-weighted) ── */
+    vec3 nhat = normal_image[pix];
+    float a = alpha_image[pix];
+
+    vec3 dl_dN = vec3(0.0); float dgx = 0.0, dgy = 0.0;
+    if (a > 0.5) {
+        float dzx = depth_image[pix + 1] - depth_image[pix - 1];
+        float dzy = depth_image[pix + pc.dims.x] - depth_image[pix - pc.dims.x];
+        ncTerm(nhat, dzx, dzy, dl_dN, dgx, dgy);
+        // loss value: 1 − |n̂·N| (only for covered pixels)
+        vec3 g = vec3(-dzx, -dzy, 1.0);
+        if (length(g) > 1e-12) {
+            vec3 N = g / length(g);
+            atomicAddFloat(0, lam_n * (1.0 - abs(dot(nhat, N))) / float(N));
+        }
+        nc_grad[N + pix*3 + 0] = lam_n * dl_dN.x / float(N);
+        nc_grad[N + pix*3 + 1] = lam_n * dl_dN.y / float(N);
+        nc_grad[N + pix*3 + 2] = lam_n * dl_dN.z / float(N);
+    } else {
+        nc_grad[N + pix*3 + 0] = 0.0;
+        nc_grad[N + pix*3 + 1] = 0.0;
+        nc_grad[N + pix*3 + 2] = 0.0;
+    }
+
+    /* ∂Lnc/∂depth at THIS pixel receives contributions from its own stencil
+     * (writing to the four neighbours' depth slots) — i.e. the GATHER form of
+     * the mirror's scatter. Each neighbour q of p, when covered, contributes
+     * ±dl_dg to d[p] via its own (dzx|dzy). We read the neighbours' states. */
+    float dg_p = 0.0;
+    // Neighbour q contributes ±dl_dg to depth_grad[p] according to whether p
+    // is q's right/left/down/up stencil slot (mirror scatter: x+1 gets −, x−1
+    // gets +, y+1 gets −, y−1 gets +).
+    if (px >= 2) {
+        uint q = pix - 1;              // p is q's RIGHT neighbour (x+1) → −
+        if (alpha_image[q] > 0.5) {
+            float qzx = depth_image[q + 1] - depth_image[q - 1];
+            float qzy = depth_image[q + pc.dims.x] - depth_image[q - pc.dims.x];
+            vec3 qN = vec3(0.0); float qgx = 0.0, qgy = 0.0;
+            ncTerm(normal_image[q], qzx, qzy, qN, qgx, qgy);
+            dg_p += -qgx;
+        }
+    }
+    if (px + 2 < pc.dims.x) {
+        uint q = pix + 1;              // p is q's LEFT neighbour (x−1) → +
+        if (alpha_image[q] > 0.5) {
+            float qzx = depth_image[q + 1] - depth_image[q - 1];
+            float qzy = depth_image[q + pc.dims.x] - depth_image[q - pc.dims.x];
+            vec3 qN = vec3(0.0); float qgx = 0.0, qgy = 0.0;
+            ncTerm(normal_image[q], qzx, qzy, qN, qgx, qgy);
+            dg_p += qgx;
+        }
+    }
+    if (py >= 2) {
+        uint q = pix - pc.dims.x;      // p is q's DOWN neighbour (y+1) → −
+        if (alpha_image[q] > 0.5) {
+            float qzx = depth_image[q + 1] - depth_image[q - 1];
+            float qzy = depth_image[q + pc.dims.x] - depth_image[q - pc.dims.x];
+            vec3 qN = vec3(0.0); float qgx = 0.0, qgy = 0.0;
+            ncTerm(normal_image[q], qzx, qzy, qN, qgx, qgy);
+            dg_p += -qgy;
+        }
+    }
+    if (py + 2 < pc.dims.y) {
+        uint q = pix + pc.dims.x;      // p is q's UP neighbour (y−1) → +
+        if (alpha_image[q] > 0.5) {
+            float qzx = depth_image[q + 1] - depth_image[q - 1];
+            float qzy = depth_image[q + pc.dims.x] - depth_image[q - pc.dims.x];
+            vec3 qN = vec3(0.0); float qgx = 0.0, qgy = 0.0;
+            ncTerm(normal_image[q], qzx, qzy, qN, qgx, qgy);
+            dg_p += qgy;
+        }
+    }
+    nc_grad[pix] = lam_n * dg_p / float(N);
+}

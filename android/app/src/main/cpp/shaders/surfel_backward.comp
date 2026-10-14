@@ -1,0 +1,448 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer SurfelBuf {
+    float surfels[];   // stride 13: center[3], quat[4], log_su, log_sv, opacity_logit, color[3]
+};
+
+layout(std430, binding = 1) readonly buffer DlDpredBuf {
+    vec3 dL_dpred[];
+};
+
+layout(std430, binding = 2) buffer GradBuf {
+    uint grads[];      // stride 12 as uint bit-patterns for atomic CAS
+};
+
+layout(std430, binding = 3) readonly buffer TargetBuf {
+    vec3 target_image[];
+};
+
+// Phase E inputs (from the loss shader): depth_grad[N] ++ normal_grad[N*3].
+layout(std430, binding = 4) readonly buffer NcGradBuf {
+    float nc_grad[];
+};
+
+layout(std430, binding = 5) buffer LossBuf {
+    uint total_loss;      // backward adds λc·(depth-convergence) here too
+};
+
+layout(push_constant) uniform PC {
+    vec4 cam_pos;
+    vec4 cam_right;
+    vec4 cam_up;
+    vec4 cam_forward;
+    vec4 intrinsics;
+    uvec4 dims;        // W, H, num_surfels, unused
+    vec4 lam;          // x = lam_n, y = lam_c (Phase E weights)
+} pc;
+
+#define SURFEL_STRIDE 13
+// grad layout (12 floats): d_center[3], d_log_su, d_log_sv, d_opacity_logit, d_color[3], d_rot[3]
+#define GRAD_STRIDE 12
+#define MAX_HITS 256
+#define ALPHA_CLAMP 0.99
+#define T_EPS 1e-4
+#define G_EPS 1e-3
+#define LOWPASS_SIGMA 0.70710678
+#define O_THRESH 0.6
+#define O_EPS 0.1
+
+// Per-pixel intersection record — fields mirror prototype hit_t.
+struct Hit {
+    int   idx;      // surfel index
+    float depth;    // camera-space depth of the hit
+    float alpha;    // opacity * G (clamped)
+    float G;        // effective weight = max(Gn, Glp)
+    float u, v;     // local tangent coords
+    int   lowpass;  // 1 if screen low-pass floor dominated
+};
+
+// Insertion sort, ascending depth — identical to the forward shader and to
+// host surfel_gather_pixel, so T_k and the suffix accumulator match the
+// rendered image exactly.
+void sortHits(inout Hit hits[256], int m) {
+    for (int i = 1; i < m; i++) {
+        Hit key = hits[i];
+        int j = i - 1;
+        while (j >= 0 && hits[j].depth > key.depth) {
+            hits[j + 1] = hits[j];
+            j--;
+        }
+        hits[j + 1] = key;
+    }
+}
+
+// Atomic float add via CAS on uint bit-pattern
+void atomicAddFloat(uint idx, float v) {
+    uint old = grads[idx];
+    uint assumed;
+    do {
+        assumed = old;
+        uint next = floatBitsToUint(uintBitsToFloat(assumed) + v);
+        old = atomicCompSwap(grads[idx], assumed, next);
+    } while (old != assumed);
+}
+
+void atomicAddLoss(float v) {
+    uint old = total_loss;
+    uint assumed;
+    do {
+        assumed = old;
+        uint next = floatBitsToUint(uintBitsToFloat(assumed) + v);
+        old = atomicCompSwap(total_loss, assumed, next);
+    } while (old != assumed);
+}
+
+// Frame columns from a quat [w,x,y,z] (same expansion as the forward).
+void frameCols(vec4 quat, out vec3 tu, out vec3 tv, out vec3 nrm) {
+    float wq = quat.x, qx = quat.y, qy = quat.z, qz = quat.w;
+    float qx2 = qx*qx, qy2 = qy*qy, qz2 = qz*qz;
+    float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz;
+    float qwx = wq*qx, qwy = wq*qy, qwz = wq*qz;
+    tu = vec3(1 - 2*(qy2+qz2), 2*(qxy+qwz), 2*(qxz-qwy));
+    tv = vec3(2*(qxy-qwz), 1 - 2*(qx2+qz2), 2*(qyz+qwx));
+    nrm = vec3(2*(qxz+qwy), 2*(qyz-qwx), 1 - 2*(qx2+qy2));
+}
+
+// Depth chain for one hit: ∂depth/∂center and ∂depth/∂(frame n).
+// depth = t·(d·fwd); t = num/denom; num = (c−o)·n; denom = d·n.
+void depthChain(vec3 center, vec3 nrm, vec3 cmo, vec3 d, float num,
+                float denom, float ddotf,
+                out vec3 d_depth_dc, out vec3 d_depth_dn) {
+    d_depth_dc = (nrm * ddotf) / denom;
+    d_depth_dn = ((cmo * denom - d * num) / (denom * denom)) * ddotf;
+}
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+    if (px >= pc.dims.x || py >= pc.dims.y) return;
+
+    uint pix = py * pc.dims.x + px;
+    uint ns = pc.dims.z;
+    float lam_n = pc.lam.x;
+    float lam_c = pc.lam.y;
+    uint N = pc.dims.x * pc.dims.y;
+    float invN = 1.0 / float(N);
+
+    vec3 dCp = dL_dpred[pix];
+    vec3 O = pc.cam_pos.xyz;
+    vec3 right = pc.cam_right.xyz;
+    vec3 up = pc.cam_up.xyz;
+    vec3 fwd = pc.cam_forward.xyz;
+    float fx = pc.intrinsics.x;
+    float fy = pc.intrinsics.y;
+    float cx = pc.intrinsics.z;
+    float cy = pc.intrinsics.w;
+
+    float ndx = (float(px) + 0.5 - cx) / fx;
+    float ndy = (float(py) + 0.5 - cy) / fy;
+    vec3 d = normalize(fwd + ndx * right + ndy * up);
+    float ddotf = dot(d, fwd);
+
+    // Forward gather: collect hits with depth, compute alpha
+    Hit hits[256];
+    int m = 0;
+
+    for (uint i = 0; i < ns && m < MAX_HITS; i++) {
+        uint base = i * SURFEL_STRIDE;
+        vec3 center = vec3(surfels[base], surfels[base+1], surfels[base+2]);
+        vec4 quat = normalize(vec4(surfels[base+3], surfels[base+4], surfels[base+5], surfels[base+6]));
+        float log_su = surfels[base+7];
+        float log_sv = surfels[base+8];
+        float opacity_logit = surfels[base+9];
+
+        vec3 tu, tv, nrm;
+        frameCols(quat, tu, tv, nrm);
+
+        float denom = dot(d, nrm);
+        if (abs(denom) < 1e-6) continue;
+        float t = dot(center - O, nrm) / denom;
+        if (t <= 1e-4) continue;
+
+        vec3 hitp = O + t * d;
+        vec3 dp = hitp - center;
+        float su = exp(log_su);
+        float sv = exp(log_sv);
+        float u_val = dot(dp, tu) / su;
+        float v_val = dot(dp, tv) / sv;
+        float G = exp(-0.5 * (u_val*u_val + v_val*v_val));
+        float depth = dot(hitp - O, fwd);
+        if (depth <= 0.0) continue;
+
+        // Low-pass
+        int lowpass = 0;
+        vec3 rel = center - O;
+        float zc = dot(rel, fwd);
+        if (zc > 1e-6) {
+            float sx = cx + fx * dot(rel, right) / zc;
+            float sy = cy + fy * dot(rel, up) / zc;
+            float ddx = (float(px) + 0.5) - sx;
+            float ddy = (float(py) + 0.5) - sy;
+            float pd2 = ddx*ddx + ddy*ddy;
+            float Glp = exp(-0.5 * pd2 / (LOWPASS_SIGMA * LOWPASS_SIGMA));
+            if (Glp > G) { G = Glp; lowpass = 1; }
+        }
+
+        if (G < G_EPS) continue;
+
+        float sig = 1.0 / (1.0 + exp(-opacity_logit));
+        float alpha = sig * G;
+        if (alpha > ALPHA_CLAMP) alpha = ALPHA_CLAMP;
+
+        hits[m].idx = int(i);
+        hits[m].depth = depth;
+        hits[m].alpha = alpha;
+        hits[m].G = G;
+        hits[m].u = u_val;
+        hits[m].v = v_val;
+        hits[m].lowpass = lowpass;
+        m++;
+    }
+
+    if (m == 0) return;
+
+    // Depth-sort front-to-back — identical order to the forward shader, so
+    // T_k and the colour / alpha gradients apply to the rendered image.
+    sortHits(hits, m);
+
+    // Forward pass for T values + per-hit weights + facing normals
+    float Tarr[256];
+    float warr[256];
+    vec3 nxf[256];
+    float T_val = 1.0;
+    int use = m;
+    vec3 rawacc = vec3(0.0);
+    for (int k = 0; k < m; k++) {
+        Tarr[k] = T_val;
+        float w = hits[k].alpha * T_val;
+        warr[k] = w;
+        uint sbase = uint(hits[k].idx) * SURFEL_STRIDE;
+        vec4 quat = normalize(vec4(surfels[sbase+3], surfels[sbase+4], surfels[sbase+5], surfels[sbase+6]));
+        vec3 tu, tv, nrm;
+        frameCols(quat, tu, tv, nrm);
+        float sfx = (dot(nrm, fwd) > 0.0) ? -1.0 : 1.0;
+        nxf[k] = nrm * sfx;
+        rawacc += nxf[k] * w;
+        T_val *= (1.0 - hits[k].alpha);
+        if (T_val < T_EPS) { use = k + 1; break; }
+    }
+
+    /* ── Phase E: depth-convergence term Σ_{k≥1} min(G_k,G_{k−1})(Δd)² ── */
+    float dgrad_k[256];
+    float ggrad_k[256];
+    float dc_p = 0.0;
+    for (int k = 0; k < MAX_HITS; k++) { dgrad_k[k] = 0.0; ggrad_k[k] = 0.0; }
+    if (lam_c != 0.0 && m > 1) {
+        for (int k = 1; k < m; k++) {
+            float gmin = min(hits[k].G, hits[k-1].G);
+            float ddk = hits[k].depth - hits[k-1].depth;
+            dc_p += gmin * ddk * ddk;
+            float d_dd = 2.0 * gmin * ddk;
+            dgrad_k[k]   += d_dd;
+            dgrad_k[k-1] -= d_dd;
+            if (hits[k].G <= hits[k-1].G)     ggrad_k[k]   += ddk * ddk;
+            if (hits[k-1].G <= hits[k].G)     ggrad_k[k-1] += ddk * ddk;
+        }
+        atomicAddLoss(lam_c * dc_p * invN);
+
+        float lc_invN = lam_c * invN;
+        for (int k = 0; k < m; k++) {
+            if (dgrad_k[k] == 0.0 && ggrad_k[k] == 0.0) continue;
+            int si = hits[k].idx;
+            uint sbase = uint(si) * SURFEL_STRIDE;
+            uint gbase = uint(si) * GRAD_STRIDE;
+            vec3 center = vec3(surfels[sbase], surfels[sbase+1], surfels[sbase+2]);
+            vec4 quat = normalize(vec4(surfels[sbase+3], surfels[sbase+4], surfels[sbase+5], surfels[sbase+6]));
+            vec3 tu, tv, nrm;
+            frameCols(quat, tu, tv, nrm);
+            float su = exp(surfels[sbase+7]);
+            float sv = exp(surfels[sbase+8]);
+            float denom = dot(d, nrm);
+            if (abs(denom) < 1e-6) continue;
+            vec3 cmo = center - O;
+            float num = dot(cmo, nrm);
+            float tt = num / denom;
+            vec3 P = O + tt * d;
+            vec3 dp = P - center;
+            float dtu_d = dot(d, tu);
+            float dtv_d = dot(d, tv);
+
+            if (dgrad_k[k] != 0.0) {
+                vec3 dc_depth, dn_depth;
+                depthChain(center, nrm, cmo, d, num, denom, ddotf, dc_depth, dn_depth);
+                float kc = lc_invN * dgrad_k[k];
+                atomicAddFloat(gbase + 0, kc * dc_depth.x);
+                atomicAddFloat(gbase + 1, kc * dc_depth.y);
+                atomicAddFloat(gbase + 2, kc * dc_depth.z);
+                vec3 tq = cross(nrm, dn_depth * kc);
+                atomicAddFloat(gbase + 9, tq.x);
+                atomicAddFloat(gbase + 10, tq.y);
+                atomicAddFloat(gbase + 11, tq.z);
+            }
+            if (ggrad_k[k] != 0.0 && hits[k].lowpass == 0) {
+                float dQ = lc_invN * ggrad_k[k];
+                float Gval = hits[k].G;
+                float dL_du = dQ * (-hits[k].u * Gval);
+                float dL_dv = dQ * (-hits[k].v * Gval);
+                atomicAddFloat(gbase + 3, dL_du * (-hits[k].u));
+                atomicAddFloat(gbase + 4, dL_dv * (-hits[k].v));
+                vec3 du_dc = (tu * (-1.0) + nrm * (dtu_d / denom)) / su;
+                vec3 dv_dc = (tv * (-1.0) + nrm * (dtv_d / denom)) / sv;
+                vec3 dc = du_dc * dL_du + dv_dc * dL_dv;
+                atomicAddFloat(gbase + 0, dc.x);
+                atomicAddFloat(gbase + 1, dc.y);
+                atomicAddFloat(gbase + 2, dc.z);
+                vec3 dL_dtu = dp * (dL_du / su);
+                vec3 dL_dtv = dp * (dL_dv / sv);
+                vec3 dt_dn = (cmo * denom - d * num) / (denom * denom);
+                float ncoef = dL_du * dtu_d / su + dL_dv * dtv_d / sv;
+                vec3 dL_dn = dt_dn * ncoef;
+                vec3 tq = cross(tu, dL_dtu) + cross(tv, dL_dtv) + cross(nrm, dL_dn);
+                atomicAddFloat(gbase + 9, tq.x);
+                atomicAddFloat(gbase + 10, tq.y);
+                atomicAddFloat(gbase + 11, tq.z);
+            }
+        }
+    }
+
+    /* ── Phase E: NC depth chain — the surface hit (first O ≥ O_THRESH) ── */
+    if (lam_n != 0.0) {
+        float dg = nc_grad[pix];
+        if (dg != 0.0) {
+            int surf_k = m - 1;
+            float O = 0.0;
+            for (int k = 0; k < m; k++) {
+                O += (hits[k].alpha + O_EPS) * hits[k].G;
+                if (O >= O_THRESH) { surf_k = k; break; }
+            }
+            int si = hits[surf_k].idx;
+            uint sbase = uint(si) * SURFEL_STRIDE;
+            uint gbase = uint(si) * GRAD_STRIDE;
+            vec3 center = vec3(surfels[sbase], surfels[sbase+1], surfels[sbase+2]);
+            vec4 quat = normalize(vec4(surfels[sbase+3], surfels[sbase+4], surfels[sbase+5], surfels[sbase+6]));
+            vec3 tu, tv, nrm;
+            frameCols(quat, tu, tv, nrm);
+            float denom = dot(d, nrm);
+            if (abs(denom) > 1e-6) {
+                vec3 cmo = center - O;
+                float num = dot(cmo, nrm);
+                float kc = dg * ddotf;
+                atomicAddFloat(gbase + 0, kc * nrm.x / denom);
+                atomicAddFloat(gbase + 1, kc * nrm.y / denom);
+                atomicAddFloat(gbase + 2, kc * nrm.z / denom);
+                vec3 dt_dn = (cmo * denom - d * num) / (denom * denom);
+                vec3 dL_dn = dt_dn * kc;
+                vec3 tq = cross(nrm, dL_dn);
+                atomicAddFloat(gbase + 9, tq.x);
+                atomicAddFloat(gbase + 10, tq.y);
+                atomicAddFloat(gbase + 11, tq.z);
+            }
+        }
+    }
+
+    /* ── Phase E: NC normal chain — merged back-to-front pass ──
+     * n̂ = Σ w_k n̂_k / |…|, so ∂L/∂α_k picks up a suffix term with
+     * "colours" = facing normals, and each hit adds dL/dn = w_k·(I−n̂n̂ᵀ)/|a|·Ng */
+    vec3 dL_drawacc = vec3(0.0);
+    if (lam_n != 0.0) {
+        vec3 Ng = vec3(nc_grad[N + pix*3], nc_grad[N + pix*3 + 1], nc_grad[N + pix*3 + 2]);
+        float al = length(rawacc);
+        if (al > 1e-12) {
+            vec3 nh = rawacc / al;
+            float nNg = dot(nh, Ng);
+            dL_drawacc = (Ng - nh * nNg) / al;
+        }
+    }
+
+    // Back-to-front gradient accumulation
+    vec3 A = vec3(0.0);       // suffix colour accumulator
+    vec3 An = vec3(0.0);      // suffix normal accumulator
+    for (int k = use - 1; k >= 0; k--) {
+        int si = hits[k].idx;
+        uint sbase = uint(si) * SURFEL_STRIDE;
+        uint gbase = uint(si) * GRAD_STRIDE;
+        vec3 color = vec3(surfels[sbase+10], surfels[sbase+11], surfels[sbase+12]);
+        float ak = hits[k].alpha;
+        float Tk = Tarr[k];
+        float wk = warr[k];
+
+        // colour gradient: d_color += dCp * (ak * Tk)
+        float wk_blend = ak * Tk;
+        atomicAddFloat(gbase + 6, dCp.x * wk_blend);
+        atomicAddFloat(gbase + 7, dCp.y * wk_blend);
+        atomicAddFloat(gbase + 8, dCp.z * wk_blend);
+
+        // alpha gradient: photometric + NC-normal suffix
+        float dL_da = dot(dCp, color) * Tk - dot(dCp, A) / (1.0 - ak + 1e-8);
+        if (dL_drawacc.x != 0.0 || dL_drawacc.y != 0.0 || dL_drawacc.z != 0.0) {
+            vec3 nf = nxf[k];
+            dL_da += dot(dL_drawacc, nf) * Tk
+                   - dot(dL_drawacc, An) / (1.0 - ak + 1e-8);
+            // frame-column gradient for the normal map (clamp-independent)
+            vec3 tq = cross(nf, dL_drawacc * wk);
+            atomicAddFloat(gbase + 9, tq.x);
+            atomicAddFloat(gbase + 10, tq.y);
+            atomicAddFloat(gbase + 11, tq.z);
+        }
+        A += color * wk;
+        An += nxf[k] * wk;
+
+        // detect clamp
+        float sig = 1.0 / (1.0 + exp(-surfels[sbase+9]));
+        float Graw = hits[k].G;
+        if (sig * Graw >= ALPHA_CLAMP) continue;
+
+        // opacity_logit grad: dL/dlogit = dL/dsig * sig*(1-sig)
+        float dL_dsig = dL_da * Graw;
+        atomicAddFloat(gbase + 5, dL_dsig * sig * (1.0 - sig));
+
+        if (hits[k].lowpass == 1) continue;
+
+        // uv-Gaussian: dG/du = -u*G
+        float dL_dG = dL_da * sig;
+        float dL_du = dL_dG * (-hits[k].u * Graw);
+        float dL_dv = dL_dG * (-hits[k].v * Graw);
+
+        // geometry recompute
+        vec3 center = vec3(surfels[sbase], surfels[sbase+1], surfels[sbase+2]);
+        vec4 quat = normalize(vec4(surfels[sbase+3], surfels[sbase+4], surfels[sbase+5], surfels[sbase+6]));
+        vec3 tu, tv, nrm;
+        frameCols(quat, tu, tv, nrm);
+        float su = exp(surfels[sbase+7]);
+        float sv = exp(surfels[sbase+8]);
+
+        float denom = dot(d, nrm);
+        if (abs(denom) < 1e-6) continue;
+        vec3 cmo = center - O;
+        float num = dot(cmo, nrm);
+        float tt = num / denom;
+        vec3 P = O + tt * d;
+        vec3 dp = P - center;
+        float dtu_d = dot(d, tu);
+        float dtv_d = dot(d, tv);
+
+        // d_log_su, d_log_sv
+        atomicAddFloat(gbase + 3, dL_du * (-hits[k].u));
+        atomicAddFloat(gbase + 4, dL_dv * (-hits[k].v));
+
+        // centre: du/dc, dv/dc
+        vec3 du_dc = (tu * (-1.0) + nrm * (dtu_d / denom)) / su;
+        vec3 dv_dc = (tv * (-1.0) + nrm * (dtv_d / denom)) / sv;
+        vec3 dc = du_dc * dL_du + dv_dc * dL_dv;
+        atomicAddFloat(gbase + 0, dc.x);
+        atomicAddFloat(gbase + 1, dc.y);
+        atomicAddFloat(gbase + 2, dc.z);
+
+        // frame torque
+        vec3 dL_dtu = dp * (dL_du / su);
+        vec3 dL_dtv = dp * (dL_dv / sv);
+        vec3 dt_dn = (cmo * denom - d * num) / (denom * denom);
+        float ncoef = dL_du * dtu_d / su + dL_dv * dtv_d / sv;
+        vec3 dL_dn = dt_dn * ncoef;
+        vec3 tq = cross(tu, dL_dtu) + cross(tv, dL_dtv) + cross(nrm, dL_dn);
+        atomicAddFloat(gbase + 9, tq.x);
+        atomicAddFloat(gbase + 10, tq.y);
+        atomicAddFloat(gbase + 11, tq.z);
+    }
+}

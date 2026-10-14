@@ -1,0 +1,36 @@
+name: QTSQStudio
+options:
+  bundleIdPrefix: com.qtsq
+targets:
+  QTSQStudio:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - tools/StudioSwift
+    dependencies:
+      - framework: libqtsq.a
+        embed: false
+      - framework: compressor/libqtc.a
+        embed: false
+    settings:
+      SWIFT_OBJC_BRIDGING_HEADER: $(PROJECT_DIR)/tools/StudioSwift/BridgingHeader.h
+      HEADER_SEARCH_PATHS:
+        - $(inherited)
+        - $(PROJECT_DIR)/include
+        - $(PROJECT_DIR)/compressor/include
+        - $(PROJECT_DIR)/crypto/common
+        - $(PROJECT_DIR)/crypto/ml-kem-768
+        - $(PROJECT_DIR)/crypto/ml-dsa-65
+        - $(PROJECT_DIR)/crypto/argon2
+      LIBRARY_SEARCH_PATHS:
+        - $(inherited)
+        - $(PROJECT_DIR)
+        - $(PROJECT_DIR)/compressor
+      PRODUCT_NAME: QTSQStudio
+      GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_NSMicrophoneUsageDescription: QTSQStudio uses the microphone to record audio for compression.
+      OTHER_LDFLAGS: $(inherited) -framework Metal -framework Foundation -framework AVFoundation -framework CoreBluetooth -framework Security -lz -lpthread -lc++ -L/opt/homebrew/Cellar/opus/1.6.1/lib -lopus
+
+
+

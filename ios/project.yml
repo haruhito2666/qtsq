@@ -1,0 +1,50 @@
+name: QTSQ
+options:
+  bundleIdPrefix: com.haruhito
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+
+targets:
+  QTSQ:
+    type: application
+    platform: iOS
+    sources:
+      - path: QTSQ
+        excludes:
+          - "**/*.plist"
+    info:
+      path: QTSQ/Info.plist
+    dependencies:
+      - framework: lib/qtsq.xcframework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.haruhito.qtsq
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_OBJC_BRIDGING_HEADER: QTSQ/QTSQ-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/../include"
+        OTHER_LDFLAGS:
+          - "-lz"
+          - "-framework Metal"
+          - "-framework MetalPerformanceShaders"
+          - "-framework CoreGraphics"
+          - "-framework AVFoundation"
+          - "-framework AudioToolbox"
+          - "-framework CoreAudio"
+        INFOPLIST_KEY_NSCameraUsageDescription: "QTSQ needs camera access to capture photos directly into .qtsq format."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "QTSQ needs microphone access to record audio directly into .qtsq format."
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: true
+        ENABLE_PREVIEWS: true
