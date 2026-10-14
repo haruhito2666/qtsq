@@ -239,7 +239,8 @@ export_onnx_weights("trained.qtsq", "arch.onnx", "out.onnx")  # needs onnx
 C/C++ engines link `libqtsq.a`: `qtsq_read` →
 `qtsq_container_get_stream` (by index; match names via `model_info`-style
 manifest parsing) → `qtsq_decompress_tensor` / `qtsq_decompress_array`.
-See `tests/test_model.c` for the exact call sequence.
+The `demos/` directory builds against the same public headers and shows
+working call sequences — build them all with `make demos`.
 
 Measured on Apple Silicon (25–39 MB mixed fp32/fp16/int8; varies with
 load): full save ~20–45 MB/s, `fast=True` ~55–115 MB/s at matched ratio
@@ -386,6 +387,23 @@ graph = data.to_graph(label=3)
 ```
 
 ---
+
+## Security
+
+**This library is not finished security work.** An audit on 2026-10-14 found
+thirteen defects that are now fixed — most seriously, per-stream encryption was
+writing the raw AES-CTR keystream over the plaintext instead of encrypting, so
+it destroyed the data it was applied to. That path had no test; it does now.
+
+Thirteen **high** and fourteen **medium** findings remain open, and roughly
+25,000 lines (`compressor/src/*.c` and the engine files) have not been audited
+at all. Known-unfixed items include fail-open decryption when a header flag is
+cleared, AES-CTR nonce reuse on re-encrypt, a plaintext private-key fallback in
+the Android keystore, and Shamir shares stored unencrypted inside the envelope
+they protect.
+
+Treat any file produced by this library as **untrusted input** until that work
+lands. Do not rely on it to protect data you cannot afford to lose.
 
 ## Install
 
