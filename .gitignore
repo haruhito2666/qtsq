@@ -81,3 +81,6 @@ profile/
 
 # Test fixtures
 src/test-images/
+
+# Stray patch file at repo root
+/patch.diff
