@@ -1308,6 +1308,7 @@ def save_tables(output_path, tables, tensors=None, password=None,
     blob_params, blob_depths, blob_policies = [], [], []
     blob_payloads, blob_channels = [], []
     _KIND_TABLE = 5
+    _CT_CSV, _CT_TSV = 3, 4
 
     for name, val in tables.items():
         sname = str(name)
@@ -1325,7 +1326,9 @@ def save_tables(output_path, tables, tensors=None, password=None,
             raise ValueError(f"table {sname!r} is empty")
         # content_type distinguishes csv from tsv for a reader; the lens
         # itself sniffs, so this is a hint, not a requirement.
-        ctype = 49 if b"\t" in text.split(b"\n", 1)[0] else 48
+        # QTSQ_CT_TEXT_TSV / QTSQ_CT_TEXT_CSV (include/qtsq_format.h).
+        # These were 48/49, which are not QTSQ_CT_* values at all.
+        ctype = _CT_TSV if b"\t" in text.split(b"\n", 1)[0] else _CT_CSV
         blob_names.append(sname)
         blob_kinds.append(_KIND_TABLE)
         blob_ctypes.append(ctype)
@@ -1384,6 +1387,137 @@ def save_tables(output_path, tables, tensors=None, password=None,
                   blob_depths=blob_depths, blob_policies=blob_policies,
                   blob_payloads=blob_payloads, blob_channels=blob_channels)
     return output_path
+
+
+_TEXT_CTYPES = {
+    "plain": 1, "json": 2, "csv": 3, "tsv": 4,
+    "source": 5, "markdown": 6, "log": 7,
+}
+
+
+def save_texts(output_path, texts, tensors=None, password=None,
+               metadata=None, fast=False, store=False, durable=True,
+               kind="plain"):
+    """Save text documents into one .qtsq, alongside tensors.
+
+    Each entry is name -> the document as str or bytes. Bytes are stored
+    verbatim: they are what was handed in and what comes back, including
+    any original encoding.
+
+    kind is a hint recorded in the stream header (plain, json, source,
+    markdown, log, csv, tsv) so a reader can classify without sniffing;
+    it does not change how the text is coded.
+
+    Returns:
+        output_path
+    """
+    import json as _json
+
+    if kind not in _TEXT_CTYPES:
+        raise ValueError(f"unknown text kind {kind!r}; "
+                         f"expected one of {sorted(_TEXT_CTYPES)}")
+
+    if not isinstance(texts, dict) or not texts:
+        raise ValueError("texts must be a non-empty dict {name: text}")
+
+    blob_names, blob_kinds, blob_ctypes = [], [], []
+    blob_params, blob_depths, blob_policies = [], [], []
+    blob_payloads, blob_channels = [], []
+    _KIND_TEXT, ctype = 2, _TEXT_CTYPES[kind]
+
+    for name, val in texts.items():
+        sname = str(name)
+        if sname == _MODEL_MANIFEST_STREAM:
+            raise ValueError(f"stream name {sname!r} is reserved")
+        if len(sname.encode("utf-8")) > _MODEL_NAME_MAX:
+            raise ValueError(f"name too long (>{_MODEL_NAME_MAX} bytes): {sname!r}")
+        if isinstance(val, str):
+            data = val.encode("utf-8")
+        elif isinstance(val, (bytes, bytearray)):
+            data = bytes(val)
+        else:
+            raise ValueError(f"text {sname!r} must be str or bytes")
+        if not data:
+            raise ValueError(f"text {sname!r} is empty")
+        blob_names.append(sname)
+        blob_kinds.append(_KIND_TEXT)
+        blob_ctypes.append(ctype)
+        blob_params.append((len(data), data.count(b"\n")))
+        blob_depths.append(0)
+        blob_policies.append(1)          # code it
+        blob_payloads.append(data)
+        blob_channels.append(0)
+
+    tensor_entries, names, payloads = [], [], []
+    dims_list, is_f32_list, elem_list, nibble_list = [], [], [], []
+    if tensors:
+        for name, arr in tensors.items():
+            sname = str(name)
+            if sname in blob_names:
+                raise ValueError(f"duplicate stream name: {sname!r}")
+            dtype_str, shape, raw, is_f32, elem_size, nibble = _model_tensor_to_bytes(
+                arr, as_view=bool(store))
+            if _raw_nbytes(raw) == 0:
+                raise ValueError(f"tensor {sname!r} is empty")
+            elem = _MODEL_DTYPE_ELEM.get(dtype_str, elem_size)
+            count = (_raw_nbytes(raw) // elem_size
+                     if elem_size in (1, 2, 4, 8) and _raw_nbytes(raw) % elem_size == 0
+                     else _raw_nbytes(raw))
+            if elem_size not in (1, 2, 4, 8):
+                elem = 1
+            names.append(sname); payloads.append(raw)
+            dims_list.append(tuple(shape) if len(shape) <= 8 else ())
+            is_f32_list.append(is_f32)
+            elem_list.append(elem_size if elem_size in (1, 2, 4, 8) else 1)
+            nibble_list.append(nibble)
+            tensor_entries.append({
+                "name": sname, "dtype": dtype_str, "shape": list(shape),
+                "stream": sname, "elem_size": elem, "count": count,
+                "kind": _MODEL_KIND_TENSOR})
+
+    text_entries = [{
+        "name": n, "kind": "text", "dtype": "uint8",
+        "shape": [len(blob_payloads[i])], "stream": n,
+        "content_type": blob_ctypes[i],
+        "original_size": len(blob_payloads[i]),
+        "lines": blob_params[i][1],
+    } for i, n in enumerate(blob_names)]
+
+    manifest = _json.dumps({
+        "format": _MODEL_FORMAT,
+        "tensors": tensor_entries + text_entries,
+        "metadata": metadata or {},
+    }, separators=(",", ":"))
+
+    output_path = os.path.abspath(output_path)
+    _c_model_save(output_path, manifest, names, payloads, dims_list,
+                  is_f32_list, elem_list, nibble_list,
+                  password=password or "", fast=1 if fast else 0,
+                  store=1 if store else 0, durable=1 if durable else 0,
+                  blob_names=blob_names, blob_kinds=blob_kinds,
+                  blob_ctypes=blob_ctypes, blob_params=blob_params,
+                  blob_depths=blob_depths, blob_policies=blob_policies,
+                  blob_payloads=blob_payloads, blob_channels=blob_channels)
+    return output_path
+
+
+def load_texts(path, password=None):
+    """Read every text stream in a file -> {name: bytes}.
+
+    Bytes come back exactly as stored, so a document that was saved as
+    UTF-8 returns UTF-8 bytes -- decode it yourself if you want str.
+    This matches load_tables()/load_images(); returning str would force a
+    decode and would fail on input that was not valid UTF-8.
+
+    Use model_info(path) to list text streams without reading them.
+    """
+    entries, _meta, _stats = model_info(os.path.abspath(path), password=password)
+    names = [n for n, t in entries.items() if t.get("kind") == "text"]
+    if not names:
+        return {}
+    res = _c_model_load_some(os.path.abspath(path), names,
+                             password=password or "")["tensors"]
+    return {n: res[n] for n in names}
 
 
 def load_tables(path, password=None):
