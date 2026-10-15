@@ -302,7 +302,7 @@ int qtc_audio_mdct_decode(const uint8_t *payload, size_t payload_len,
  * quality knob's bitrate mapping (44.1 kHz reference). */
 int qtc_audio_mdct2_encode(const uint8_t *pcm, uint32_t nframes,
                            uint8_t channels, uint8_t bps, float quality,
-                           int target_kbps,
+                           int target_kbps, int sample_rate,
                            uint8_t **out, size_t *out_len);
 int qtc_audio_mdct2_decode(const uint8_t *payload, size_t payload_len,
                            uint8_t **out_pcm, uint32_t *out_nframes,
@@ -324,7 +324,8 @@ int qtc_audio_mdct2_decode(const uint8_t *payload, size_t payload_len,
 
 int qtc_audio_float_encode(const float *pcm, uint32_t nframes,
                            uint8_t channels, float quality, int target_kbps,
-                           int lossy, uint8_t **out, size_t *out_len);
+                           int lossy, int sample_rate,
+                           uint8_t **out, size_t *out_len);
 int qtc_audio_float_decode(const uint8_t *payload, size_t payload_len,
                            float **out_pcm, uint32_t *out_nframes,
                            uint8_t *out_channels);

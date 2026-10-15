@@ -1095,6 +1095,7 @@ int qtc_compress_audio(const uint8_t *pcm, uint32_t nframes,
     if (lossy)
         rc = qtc_audio_mdct2_encode(pcm, nframes, channels, bps,
                                     opts->quality, opts->target_kbps,
+                                    opts->sample_rate,
                                     &payload, &payload_len);
     else
         rc = qtc_audio_encode(pcm, nframes, channels, bps,
@@ -1171,6 +1172,7 @@ int qtc_compress_audio_float(const float *pcm, uint32_t nframes,
     size_t payload_len = 0;
     int rc = qtc_audio_float_encode(pcm, nframes, channels, opts->quality,
                                     opts->target_kbps, lossy,
+                                    opts->sample_rate,
                                     &payload, &payload_len);
     if (rc != QTC_OK)
         return rc;

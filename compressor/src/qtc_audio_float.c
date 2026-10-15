@@ -227,7 +227,7 @@ static int afloat_encode_lossless(const float *pcm, uint32_t nframes,
  * the peak so decode restores float levels. */
 static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
                                uint8_t channels, float quality,
-                               int target_kbps,
+                               int target_kbps, int sample_rate,
                                uint8_t **out, size_t *out_len)
 {
     size_t total = (size_t)nframes * channels;
@@ -258,7 +258,7 @@ static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
     uint8_t *mdct = NULL;
     size_t mdct_len = 0;
     int rc = qtc_audio_mdct2_encode((const uint8_t *)i16, nframes, channels,
-                                    16, quality, target_kbps,
+                                    16, quality, target_kbps, sample_rate,
                                     &mdct, &mdct_len);
     free(i16);
     if (rc != QTC_OK)
@@ -285,7 +285,8 @@ static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
 
 int qtc_audio_float_encode(const float *pcm, uint32_t nframes,
                            uint8_t channels, float quality, int target_kbps,
-                           int lossy, uint8_t **out, size_t *out_len)
+                           int lossy, int sample_rate,
+                           uint8_t **out, size_t *out_len)
 {
     if (!pcm || nframes == 0 || channels == 0 ||
         channels > QTC_AUDIO_FLOAT_MAX_CH)
@@ -299,7 +300,7 @@ int qtc_audio_float_encode(const float *pcm, uint32_t nframes,
 
     if (lossy)
         return afloat_encode_lossy(pcm, nframes, channels, quality,
-                                   target_kbps, out, out_len);
+                                   target_kbps, sample_rate, out, out_len);
     return afloat_encode_lossless(pcm, nframes, channels, out, out_len);
 }
 

@@ -81,6 +81,14 @@ typedef struct {
     uint32_t     min_compress_size; /* 0 → QTC_CHANDRASEKHAR_LIMIT       */
     int          target_kbps;       /* lossy audio bitrate target; 0 =
                                        derive from quality (Phase 5.7)   */
+    /* Sample rate of any audio passed in. The lossy lens converts a
+     * kbps target into a bits-per-coefficient budget, and that budget is
+     * only correct if it divides by the stream's ACTUAL rate -- it used
+     * to assume 44100 unconditionally, so a 48 kHz stream asked for
+     * 128 kbps produced 139 kbps (48000/44100 = 1.088). 0 or negative
+     * means "assume 44100", which keeps the old behaviour for callers
+     * that do not know the rate. */
+    int          sample_rate;
     /* Pixel count above which the lossy image contest stops running the
      * O(n^2)/multi-pass scene coders (mesh, accretion) and runs only the
      * DCT photo coder. 0 = QTC_CONTEST_MAX_PIXELS_DEFAULT. This was a

@@ -245,7 +245,7 @@ static inline int width_for_maxq(int32_t maxq)
 
 /* ── quality knob → bits-per-coefficient budget ─────────────────────── */
 
-static double quality_to_beta(float quality)
+static double quality_to_beta(float quality, double rate)
 {
     /* Anchors chosen so a 44.1 kHz stereo stream lands on familiar
      * bitrates: q=1.0→320k, 0.85→192k, 0.5→128k, 0.25→96k, 0.0→48k.
@@ -269,7 +269,7 @@ static double quality_to_beta(float quality)
         double lkb = log2(kb[i - 1]) + t * (log2(kb[i]) - log2(kb[i - 1]));
         kbps = pow(2.0, lkb);
     }
-    return kbps / (2.0 * MDCT2_RATE_REF / 1000.0);
+    return kbps / (2.0 * rate / 1000.0);
 }
 
 /* ── bit allocation: energies + lambda → per-frame band decisions ───── */
@@ -413,7 +413,7 @@ static int pack_stream(const bands2_t *bt, const band_dec_t *dec,
 
 int qtc_audio_mdct2_encode(const uint8_t *pcm, uint32_t nframes,
                            uint8_t channels, uint8_t bps, float quality,
-                           int target_kbps,
+                           int target_kbps, int sample_rate,
                            uint8_t **out, size_t *out_len)
 {
     int N = MDCT2_N;
@@ -441,9 +441,13 @@ int qtc_audio_mdct2_encode(const uint8_t *pcm, uint32_t nframes,
     int nb = bt.nbands;
     int side_bytes = bands2_side_bytes(&bt);
 
+    /* Bits-per-coefficient budget. Dividing by the stream's own rate is
+     * what makes target_kbps mean target_kbps; dividing by a fixed 44.1k
+     * silently over-produced by rate/44100 on everything else. */
+    double rate = (sample_rate > 0) ? (double)sample_rate : MDCT2_RATE_REF;
     double beta = (target_kbps > 0)
-        ? (double)target_kbps / ((MDCT2_RATE_REF / 1000.0) * nch)
-        : quality_to_beta(quality);
+        ? (double)target_kbps / ((rate / 1000.0) * nch)
+        : quality_to_beta(quality, rate);
 
     size_t mf = ((size_t)nframes + (size_t)N - 1) / (size_t)N + 1;
     size_t total = (mf + 1) * (size_t)N;
