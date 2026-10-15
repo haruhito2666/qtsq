@@ -84,3 +84,6 @@ src/test-images/
 
 # Stray patch file at repo root
 /patch.diff
+
+# Xcode derived data for the macOS apps
+build/

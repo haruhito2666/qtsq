@@ -133,21 +133,27 @@ metallib:
 	@metallib -ci metal/*.metal -o build/default.metallib 2>/dev/null || \
 	    echo "no metal shaders; skipping"
 
-studio: $(LIB) metallib
-	@mkdir -p bin build/QTSQStudio.app/Contents/MacOS
-	$(CC) $(CFLAGS) -O2 tools/StudioSwift/*.m -L. -lqtsq $(LDFLAGS) $(OSXFLAGS) \
-	    -o build/QTSQStudio.app/Contents/MacOS/QTSQStudio -lc++ 2>/dev/null || \
-	    echo "studio sources absent; use xcodeproj"
-	@cp -R QTSQStudio.app/Contents/Resources build/QTSQStudio.app/Contents/ 2>/dev/null || true
+# The Swift apps are built by Xcode, not by cc: the sources are .swift,
+# so compiling them with $(CC) could never have worked. Drive xcodebuild.
+STUDIO_SCHEME = QTSQStudio
+PHOTON_SCHEME = PhotonStudio
+XCODE_DERIVED = build/dd
+
+studio: $(LIB)
+	@command -v xcodebuild >/dev/null || { echo "xcodebuild not found"; exit 1; }
+	@echo "═══ QTSQStudio (Release) ═══"
+	xcodebuild -project QTSQStudio.xcodeproj -scheme $(STUDIO_SCHEME) \
+	    -configuration Release -derivedDataPath $(XCODE_DERIVED) build
+	@echo "built: $(XCODE_DERIVED)/Build/Products/Release/$(STUDIO_SCHEME).app"
 
 studio-app: studio
 
-photon-studio: $(LIB) metallib
-	@mkdir -p build/PhotonStudio.app/Contents/MacOS
-	$(CC) $(CFLAGS) -O2 tools/PhotonStudioSwift/*.m -L. -lqtsq $(LDFLAGS) $(OSXFLAGS) \
-	    -o build/PhotonStudio.app/Contents/MacOS/PhotonStudio -lc++ 2>/dev/null || \
-	    echo "photon studio sources absent; use xcodeproj"
-	@cp -R PhotonStudio.app/Contents/Resources build/PhotonStudio.app/Contents/ 2>/dev/null || true
+photon-studio: $(LIB)
+	@command -v xcodebuild >/dev/null || { echo "xcodebuild not found"; exit 1; }
+	@echo "═══ PhotonStudio (Release) ═══"
+	xcodebuild -project PhotonStudio.xcodeproj -scheme $(PHOTON_SCHEME) \
+	    -configuration Release -derivedDataPath $(XCODE_DERIVED) build
+	@echo "built: $(XCODE_DERIVED)/Build/Products/Release/$(PHOTON_SCHEME).app"
 
 photon-studio-app: photon-studio
 

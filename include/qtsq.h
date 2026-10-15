@@ -313,6 +313,15 @@ typedef struct qtsq_video_encoder qtsq_video_encoder_t;
  * Output targets visual parity with .mp4 first; iterate on quality later. */
 #define QTSQ_VIDEO_PIXEL 0x20000
 
+/* The non-pixel (continuous) selection: no strategy flag set. The
+ * encoder reads this as is_pixel_mode = (flags & QTSQ_VIDEO_PIXEL) != 0,
+ * so 0 selects the continuous path. This define had been dropped from
+ * the header while the encoder still honoured it, which left
+ * StudioSwift/CompressView.swift referencing an undeclared symbol and
+ * the macOS app unbuildable. Kept explicit rather than written as a
+ * bare 0 at the call sites so the choice stays readable. */
+#define QTSQ_VIDEO_CONTINUOUS 0x00000
+
 /* Initialize a video encoder session */
 qtsq_video_encoder_t* qtsq_video_encoder_create(qtsq_context_t *ctx,
                                                 uint32_t width, uint32_t height,
