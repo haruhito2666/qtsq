@@ -1150,7 +1150,8 @@ def save_audios(output_path, audios, tensors=None, password=None,
     raw samples with the qtc audio lens, which is bit-exact and measured at
     roughly 7-50x on speech-grade material depending on content.
 
-    channels must be 1..16 and bits_per_sample 8, 16 or 24; anything else
+    channels must be exactly 2 (qtsq is stereo-only) and bits_per_sample
+    8, 16 or 24; anything else
     is rejected rather than written. Tensors may be passed alongside so a
     model and its sample data share one file.
 
@@ -1186,8 +1187,11 @@ def save_audios(output_path, audios, tensors=None, password=None,
         pcm = bytes(pcm) if not isinstance(pcm, (bytes, bytearray)) else bytes(pcm)
         if not pcm:
             raise ValueError(f"audio {sname!r} is empty")
-        if not (1 <= channels <= 16):
-            raise ValueError(f"audio {sname!r}: channels must be 1..16, got {channels}")
+        if channels != 2:
+            raise ValueError(
+                f"audio {sname!r}: qtsq is stereo-only, got {channels} channels. "
+                f"Duplicate a mono source to both channels; mono is never "
+                f"stored, so a mono file would cost the same space anyway.")
         if bps not in (8, 16, 24):
             raise ValueError(f"audio {sname!r}: bits_per_sample must be 8/16/24, got {bps}")
         frame_bytes = channels * (bps // 8)

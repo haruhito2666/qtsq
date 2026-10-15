@@ -233,7 +233,11 @@ static int audio_geometry(size_t raw_size, uint32_t channels,
                           uint8_t bit_depth, uint32_t declared_frames,
                           uint32_t *out_frames)
 {
-    if (channels < 1 || channels > 16) return 0;
+    /* qtsq is stereo-only. Mono is never stored: it would occupy the
+     * same space as the stereo pair (the mid/side coder needs both
+     * channels to decorrelate) while costing twice the bits per
+     * second of real content. Callers duplicate a mono source instead. */
+    if (channels != 2) return 0;
     if (bit_depth != 8 && bit_depth != 16 && bit_depth != 24) return 0;
     size_t frame_bytes = (size_t)channels * (bit_depth / 8u);
     if (raw_size == 0 || (raw_size % frame_bytes) != 0) return 0;
