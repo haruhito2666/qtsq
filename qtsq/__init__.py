@@ -1287,13 +1287,11 @@ def save_tables(output_path, tables, tensors=None, password=None,
     are detected automatically (only when one clearly dominates), so the
     caller does not have to declare a delimiter.
 
-    The table lens contests row-major against column-major ordering and
-    keeps whichever encodes smaller. Column-major wins large on numeric
-    tables (measured -34% on a 165kB CSV) because the bytes are already
-    compressible and only their ORDER defeats LZ; row-major wins on
-    categorical tables (-26%), which repeat whole rows that front-coding
-    already collapses. Contesting both means this can never lose to
-    storing the text as-is.
+    The table lens codes rows in order. A column-major contest existed and
+    was removed after measurement: front-coding collapses repeated rows and
+    transposition destroys exactly that repetition, so row order won on
+    every table shape tested — including the numeric CSVs the contest was
+    predicted to win. Column-major (mode 2) still decodes.
 
     Transcoding is only attempted for a strict rectangle (one delimiter,
     no quoting, no CR, no empty or ragged rows). Anything else — quoted

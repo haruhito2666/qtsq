@@ -87,6 +87,79 @@ recovered_csv = qtsq.decompress_text("data.qtsq")
 
 ---
 
+## Audio
+
+qtsq audio is **stereo-only**. Mono costs the same space as the stereo
+pair — the mid/side coder needs both channels to decorrelate — so mono
+streams are rejected rather than stored at half value.
+
+### Lossless (Python)
+
+`save_audios()` codes raw interleaved PCM with the qtc audio lens,
+bit-exact, measured at roughly 7–50x on speech-grade material depending
+on content. 8/16/24-bit samples are accepted; channels must be exactly 2.
+
+```python
+import numpy as np
+import qtsq
+
+# Each entry is (pcm_bytes, channels, bits_per_sample); channels must be 2.
+pcm = np.zeros((44100, 2), np.int16).tobytes()        # 1 s stereo
+qtsq.save_audios("clip.qtsq", {"room": (pcm, 2, 16)})
+
+audios = qtsq.load_audios("clip.qtsq")   # {name: (pcm, channels, bits)}
+```
+
+`load_audios()` returns samples exactly as stored, so a round-trip is
+bit-exact. This path does not record a sample rate in the manifest
+(`"sample_rate": 0`); carry it in `metadata` if downstream code needs it.
+
+### Perceptual, MP3-comparable (C / QTSQStudio)
+
+`qtsq_compress_audio_float()` with `ctx.quality > 0` selects the MDCT2
+perceptual coder at a target bitrate — the same path QTSQStudio uses for
+capture. It measured at MP3 parity (±1 dB PSNR against LAME 3.100 at
+matched bitrate) on 48 kHz stereo.
+
+| `ctx.quality` | Target | Payload on a 220.8 s reference |
+|---|---|---|
+| 1.0 | 320 kbps | 8.83 MB |
+| 0.85 | 192 kbps | 5.30 MB |
+| 0.5 | 128 kbps | 3.53 MB |
+| 0.25 | 96 kbps | 2.65 MB |
+
+At 128 kbps the result is 3.54 MB against a 3.59 MB source MP3, i.e. the
+size you get from an MP3 encoder at that rate. Lossy streams set
+`QTSQ_FLAG_LOSSY`; their SHA-256 covers the original floats, so readers
+skip checksum verification for them.
+
+```c
+#include "qtsq.h"
+#include "qtsq_vault.h"
+
+qtsq_context_t ctx;
+qtsq_init(&ctx);
+ctx.quality = 0.5f;                      /* 128 kbps */
+
+qtsq_compress_audio_float(&ctx, pcm_f32, nframes * 2, 44100, 2);
+
+qtsq_vault_encrypt_password(&ctx, "passphrase");   /* writes are encrypted */
+qtsq_write(&ctx, "song.qtsq");
+```
+
+Read it back with `qtsq_decompress_audio_float()` (interleaved float32,
+already at the playback engine's native format) or the generic
+`qtsq_decompress()`, which routes `sample_depth == 32` audio to the float
+decoder. Decoding returns 32-bit floats, not int16.
+
+A lossless spectral-dictionary codec (`qtsq_compress_audio`, strategy
+`Fourier`) exists and still decodes old files, but it is not used for new
+captures: it is lossless, and on already-compressed sources such as MP3
+it has no redundancy left to exploit — it expanded a 3.4 MB MP3 to
+16.1 MB.
+
+---
+
 ## Tensors (AI Weights & Embeddings)
 
 Store neural network weights with configurable precision. Smaller precision = smaller file, slightly less accuracy.
