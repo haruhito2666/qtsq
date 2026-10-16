@@ -336,6 +336,21 @@ static int qtsq_decompress_dispatch(qtsq_context_t *ctx,
                 ctx->header.data_type == QTSQ_TYPE_AUDIO_STEREO ||
                 ctx->header.data_type == QTSQ_TYPE_AUDIO_MULTI ||
                 ctx->header.data_type == QTSQ_TYPE_SIGNAL_1D) {
+                /* Phase 6b float32 payloads (MDCT2 lossy stereo audio via
+                 * qtsq_compress_audio_float) carry sample_depth 32 and are
+                 * rejected by the int16 decoder -- route them to the float
+                 * path so generic consumers can decode them. */
+                if (ctx->header.sample_depth == 32) {
+                    float *fpcm = NULL;
+                    size_t ns = 0;
+                    uint32_t sr = 0;
+                    uint8_t ch = 0;
+                    int r = qtsq_decompress_audio_float(ctx, &fpcm, &ns, &sr, &ch);
+                    if (r != QTSQ_OK) return r;
+                    *out_data = (uint8_t *)fpcm;
+                    *out_size = ns * sizeof(float);
+                    return QTSQ_OK;
+                }
                 int16_t *pcm = NULL;
                 size_t ns = 0;
                 uint32_t sr = 0;
