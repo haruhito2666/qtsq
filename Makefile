@@ -169,6 +169,21 @@ photon-studio: $(LIB)
 
 photon-studio-app: photon-studio
 
+# Headless verification of the QTSQStudio playback path (qtsq_read -> device
+# key decrypt -> MDCT2 float decode), without a window or audio device.
+HARNESS_SWIFT = tools/StudioSwift/DeviceKeyStore.swift tools/StudioSwift/QTSQHeadlessPlayback.swift
+headless-playback: $(LIB)
+	@command -v xcrun >/dev/null || { echo "xcrun not found"; exit 1; }
+	@mkdir -p bin
+	xcrun swiftc -O -import-objc-header tools/StudioSwift/BridgingHeader.h \
+	    -Xcc -Iinclude -Xcc -Icompressor/include -Xcc -Icrypto/common \
+	    $(HARNESS_SWIFT) -L. -lqtsq -lz \
+	    -framework Foundation -framework AppKit -framework CoreFoundation \
+	    -framework Security -framework Metal -framework CoreAudio \
+	    -framework AudioToolbox -framework AVFoundation -lc++ \
+	    $(LDFLAGS) -o bin/qtsq_headless
+	@echo "built: bin/qtsq_headless  (usage: bin/qtsq_headless <file.qtsq>)"
+
 xcodeproj:
 	@echo "open QTSQStudio.xcodeproj / PhotonStudio.xcodeproj in Xcode"
 
