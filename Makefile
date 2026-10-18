@@ -25,7 +25,9 @@ ifeq ($(UNAME),Darwin)
   # Metal compute path. These are link-time requirements of libqtsq.a,
   # not just of the apps, so every test binary needs them too.
   LDFLAGS += -lz -framework CoreFoundation -framework Security \
-             -framework Metal -framework Foundation
+             -framework Metal -framework Foundation \
+             -framework AVFoundation -framework CoreBluetooth \
+             -framework CoreAudio -framework CoreMedia -framework AudioToolbox
   METAL    = metal
   OSXFLAGS = -framework Metal -framework Foundation
 else
@@ -43,6 +45,13 @@ OBJ_CORE  = $(OBJ) $(CRYPTO_OBJ)
 # qtsq_triangle_only.c call. A *.c-only wildcard omits it and every
 # link then fails on those symbols.
 CORE_SRC   = $(wildcard src/*.c) $(wildcard src/*.mm)
+# src/qtsq_photon_coreaudio.m is Objective-C (AVFoundation/CoreAudio/
+# CoreBluetooth) and defines photon_coreaudio_* which PhotonStudio links.
+# It only builds on Darwin, so it is added there rather than wildcarded
+# everywhere.
+ifeq ($(UNAME),Darwin)
+  CORE_SRC += $(wildcard src/*.m)
+endif
 CRYPTO_SRC = $(wildcard crypto/*/*.c)
 QTC_SRC    = $(wildcard compressor/src/*.c)
 TEST_SRC   = $(wildcard tests/*.c)
@@ -69,7 +78,8 @@ endif
 # list below, so make tries to parse the .mm as a makefile.
 CORE_C     = $(filter %.c,$(CORE_SRC))
 CORE_MM    = $(filter %.mm,$(CORE_SRC))
-OBJ        = $(CORE_C:.c=.o) $(CORE_MM:.mm=.o)
+CORE_M     = $(filter %.m,$(CORE_SRC))
+OBJ        = $(CORE_C:.c=.o) $(CORE_MM:.mm=.o) $(CORE_M:.m=.o)
 CRYPTO_OBJ = $(patsubst crypto/%.c,crypto/%.o,$(CRYPTO_SRC))
 QTC_OBJ    = $(patsubst compressor/src/%.c,compressor/src/%.o,$(QTC_SRC))
 
@@ -122,7 +132,7 @@ vtxdump: $(LIB)
 
 viewer: $(LIB)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -O2 tools/qtsq_viewer.m -L. -lqtsq $(LDFLAGS) $(OSXFLAGS) -o bin/qtsq_viewer -lc++
+	$(CC) $(CFLAGS) -O2 tools/qtsq_viewer.m -L. -lqtsq $(LDFLAGS) -framework Cocoa -framework AudioToolbox $(OSXFLAGS) -o bin/qtsq_viewer -lc++
 
 dylib: $(OBJ_CORE) $(QTC_LIB)
 	$(CC) -shared -o libqtsq.dylib $(OBJ_CORE) $(LDFLAGS)
@@ -143,7 +153,8 @@ studio: $(LIB)
 	@command -v xcodebuild >/dev/null || { echo "xcodebuild not found"; exit 1; }
 	@echo "═══ QTSQStudio (Release) ═══"
 	xcodebuild -project QTSQStudio.xcodeproj -scheme $(STUDIO_SCHEME) \
-	    -configuration Release -derivedDataPath $(XCODE_DERIVED) build
+	    -configuration Release -derivedDataPath $(XCODE_DERIVED) \
+	    ONLY_ACTIVE_ARCH=YES build
 	@echo "built: $(XCODE_DERIVED)/Build/Products/Release/$(STUDIO_SCHEME).app"
 
 studio-app: studio
@@ -152,7 +163,8 @@ photon-studio: $(LIB)
 	@command -v xcodebuild >/dev/null || { echo "xcodebuild not found"; exit 1; }
 	@echo "═══ PhotonStudio (Release) ═══"
 	xcodebuild -project PhotonStudio.xcodeproj -scheme $(PHOTON_SCHEME) \
-	    -configuration Release -derivedDataPath $(XCODE_DERIVED) build
+	    -configuration Release -derivedDataPath $(XCODE_DERIVED) \
+	    ONLY_ACTIVE_ARCH=YES build
 	@echo "built: $(XCODE_DERIVED)/Build/Products/Release/$(PHOTON_SCHEME).app"
 
 photon-studio-app: photon-studio
@@ -209,7 +221,7 @@ PHASE_TESTS = test_layered_encryption test_shamir_csprng test_two_intent \
               test_geometry_seal test_freqdct test_container_name_enc \
               test_security test_gf256 test_splat2d test_surfel \
               test_photon_fusion test_turbo test_model test_stream_crypto \
-              test_qtc_integration test_video_pixel
+              test_qtc_integration test_video_pixel test_vault_reentry test_censorship_kdf test_shamir_security test_container_bounds
 
 define RUN_PHASE_TESTS
 	@mkdir -p bin

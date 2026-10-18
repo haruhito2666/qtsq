@@ -8,6 +8,7 @@
 #include "qtsq.h"
 #include "qtsq_keystore.h"
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -143,7 +144,7 @@ int tsubu_container_write(const char *filename,
     } else {
         /* Generate random UUID v4 (M15 fix: was srand(time)+rand() —
          * predictable to the second, not thread-safe. Now uses CSPRNG.) */
-        randombytes(aid, 16);
+        if (qtsq_random_bytes(aid, 16) != 0) return QTSQ_ERR_RANDOM;
         aid[6] = (aid[6] & 0x0F) | 0x40; /* version 4 */
         aid[8] = (aid[8] & 0x3F) | 0x80; /* variant 1 */
     }

@@ -495,8 +495,10 @@ static void *reader_thread_fn(void *arg) {
         uint32_t src_offset = ion->offset;
         uint16_t src_size = ion->size;
 
-        /* Bounds check */
-        if (src_offset + src_size <= t->source_size) {
+        /* Bounds check (M-3: uint32 + uint16 promoted to 32 bits and could
+         * wrap before the comparison; also cap to the slot allocation). */
+        if ((size_t)src_offset + (size_t)src_size <= (size_t)t->source_size &&
+            src_size <= QTSQ_ION_SIZE_MAX) {
             memcpy(t->slots[slot].data, t->source + src_offset, src_size);
             t->slots[slot].data_size = src_size;
             t->slots[slot].state = ION_SLOT_LOADED;

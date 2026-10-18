@@ -6,6 +6,7 @@
 #include "qtsq_sanitize.h"
 #include "qtsq_format.h"
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -81,8 +82,10 @@ int qtsq_sanitize_image_lsb(uint8_t *pixels, uint32_t width, uint32_t height, ui
     size_t random_len = (total_bytes / 4) + 1;
     uint8_t *rand_stream = (uint8_t *)malloc(random_len);
     if (!rand_stream) return QTSQ_ERR_ALLOC;
-
-    randombytes(rand_stream, random_len);
+    if (qtsq_random_bytes(rand_stream, random_len) != 0) {
+        free(rand_stream);
+        return QTSQ_ERR_RANDOM;
+    }
 
     for (size_t i = 0; i < total_bytes; i++) {
         uint8_t r_byte = rand_stream[i / 4];
@@ -107,8 +110,10 @@ int qtsq_sanitize_image_lsb16(uint16_t *pixels, uint32_t width, uint32_t height,
     size_t random_len = (total_samples / 4) + 1;
     uint8_t *rand_stream = (uint8_t *)malloc(random_len);
     if (!rand_stream) return QTSQ_ERR_ALLOC;
-
-    randombytes(rand_stream, random_len);
+    if (qtsq_random_bytes(rand_stream, random_len) != 0) {
+        free(rand_stream);
+        return QTSQ_ERR_RANDOM;
+    }
 
     for (size_t i = 0; i < total_samples; i++) {
         uint8_t r_byte = rand_stream[i / 4];
@@ -263,8 +268,10 @@ int qtsq_sanitize_audio_lsb(int16_t *samples, size_t num_samples) {
     size_t random_len = (num_samples / 4) + 1;
     uint8_t *rand_stream = (uint8_t *)malloc(random_len);
     if (!rand_stream) return QTSQ_ERR_ALLOC;
-
-    randombytes(rand_stream, random_len);
+    if (qtsq_random_bytes(rand_stream, random_len) != 0) {
+        free(rand_stream);
+        return QTSQ_ERR_RANDOM;
+    }
 
     for (size_t i = 0; i < num_samples; i++) {
         uint8_t r_byte = rand_stream[i / 4];

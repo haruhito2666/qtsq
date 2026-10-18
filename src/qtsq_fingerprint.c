@@ -91,7 +91,8 @@ int qtsq_fingerprint_embed(splat2d_t *splats, uint32_t count,
 
 int qtsq_fingerprint_extract(const splat2d_t *original_splats, uint32_t count,
                               uint32_t width, uint32_t height,
-                              const uint8_t *suspect_pixels, uint8_t channels,
+                              const uint8_t *suspect_pixels, size_t suspect_size,
+                              uint8_t channels,
                               const uint8_t master_key[32],
                               const uint8_t candidate_ids[][32],
                               uint32_t num_candidates,
@@ -99,6 +100,11 @@ int qtsq_fingerprint_extract(const splat2d_t *original_splats, uint32_t count,
     if (!original_splats || count == 0 || !suspect_pixels || !master_key ||
         !candidate_ids || num_candidates == 0 || !match_index || !match_score)
         return QTSQ_ERR_NULL;
+    /* M-11: the sampler indexes suspect_pixels up to
+     * ((height-1) * width + width-1) * channels; without this the call had
+     * no way to verify the buffer is that large. */
+    if (channels < 1 || channels > 4) return QTSQ_ERR_FORMAT;
+    if ((uint64_t)width * height * channels > suspect_size) return QTSQ_ERR_FORMAT;
 
     /* Strategy: For each splat, we know its original position.
      * We examine the suspect image at the expected perturbed positions

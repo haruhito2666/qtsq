@@ -15,6 +15,7 @@
 #include "qtsq_shamir.h"
 #include "qtsq.h"
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include "../crypto/common/fips202.h"
 #include <string.h>
 #include <stdlib.h>
@@ -140,6 +141,9 @@ int qtsq_shamir_split(const qtsq_context_t *ctx,
         shares[i].radiation_index = NULL;
         shares[i].wormholes = NULL;
         shares[i].original_input = NULL;
+        shares[i].recovery.chunk_checksums = NULL;
+        shares[i].recovery.reed_solomon_parity = NULL;
+        shares[i].recovery.parity_size = 0;
         shares[i].num_transforms = 0;
         shares[i].num_radiation = 0;
         shares[i].num_wormholes = 0;
@@ -157,19 +161,6 @@ int qtsq_shamir_split(const qtsq_context_t *ctx,
         shares[i].header.flags |= QTSQ_FLAG_SECRET_SHARE;
     }
 
-    /* Phase 2c: Compute commitment to secret for integrity checking.
-     * Store SHA3-256(singularity) — the full 32 bytes, not just 4 — so
-     * a forged share set has negligible probability of passing (was 1 in
-     * 2^32 with only 4 bytes).
-     * dimensions[7] holds bytes 0-3; schema.encoding holds bytes 4-35. */
-    uint8_t commitment[32];
-    sha3_256(commitment, ctx->singularity, sz);
-
-    for (int i = 0; i < n; i++) {
-        memcpy(&shares[i].schema.dimensions[7], commitment, 4);  /* bytes 0-3 */
-        memcpy(shares[i].schema.encoding, commitment + 4, 28);  /* bytes 4-31 */
-    }
-
     uint8_t coeffs[254]; /* max k-1 = 253 coefficients */
     uint8_t xs[255];
     for (uint8_t i = 0; i < n; i++) xs[i] = i + 1;
@@ -180,7 +171,10 @@ int qtsq_shamir_split(const qtsq_context_t *ctx,
         uint8_t secret_byte = ctx->singularity[pos];
 
         /* Generate k-1 truly random coefficients from CSPRNG (not derived from one seed) */
-        randombytes(coeffs, k - 1);
+        if (qtsq_random_bytes(coeffs, k - 1) != 0) {
+            for (uint8_t j = 0; j < n; j++) free(shares[j].singularity);
+            return QTSQ_ERR_RANDOM;
+        }
 
         /* Build polynomial: poly[0]=secret, poly[1..k-1]=random coeffs */
         uint8_t poly[255];
@@ -193,9 +187,25 @@ int qtsq_shamir_split(const qtsq_context_t *ctx,
         }
     }
 
-    /* Phase 2c: No seed/poly_master to clean since we use randombytes directly */
+    /* H-9: shares used to carry SHA3-256(secret) in cleartext
+     * (dimensions[7] + schema.encoding), so any single share answered
+     * "is the secret X?" offline and Shamir's information-theoretic
+     * property -- the reason this scheme exists -- was gone. Each share
+     * now carries a digest of ITS OWN bytes instead. That still catches a
+     * corrupted or half-rewritten share at reconstruct time and reveals
+     * nothing beyond the share itself. (Detecting a fully re-forged share
+     * set would need verifiable secret sharing; a hash commitment never
+     * provided that -- a forger just commits to the forged secret.) */
+    for (uint8_t i = 0; i < n; i++) {
+        uint8_t digest[32];
+        sha3_256(digest, shares[i].singularity, sz);
+        memcpy(&shares[i].schema.dimensions[7], digest, 4);   /* bytes 0-3 */
+        memcpy(shares[i].schema.encoding, digest + 4, 28);    /* bytes 4-31 */
+        memset(digest, 0, sizeof(digest));
+    }
+
+    /* No seed/poly_master to clean since we use randombytes directly */
     memset(coeffs, 0, sizeof(coeffs));
-    memset(commitment, 0, 32);
 
     return QTSQ_OK;
 }
@@ -230,9 +240,25 @@ int qtsq_shamir_reconstruct(const qtsq_context_t *shares, uint8_t k,
         if (xs[i] == 0) return QTSQ_ERR_FORMAT; /* x=0 is reserved for secret */
     }
 
-    /* Allocate output singularity */
+    /* Allocate output singularity.
+     * M-9: shares read back from disk (qtsq_keystore_recover) own live
+     * transform/radiation/wormhole/original_input/recovery buffers. The
+     * struct copy must not make `out` a second owner, or freeing both
+     * double-frees. Detach every borrowed pointer BEFORE the malloc can
+     * fail, because callers free `out` on the error path. */
     *out = shares[0]; /* Copy header/schema from first share */
     out->header.flags &= ~QTSQ_FLAG_SECRET_SHARE; /* Remove share flag */
+    out->transforms = NULL;
+    out->radiation_index = NULL;
+    out->wormholes = NULL;
+    out->original_input = NULL;
+    out->recovery.chunk_checksums = NULL;
+    out->recovery.reed_solomon_parity = NULL;
+    out->recovery.parity_size = 0;
+    out->num_transforms = 0;
+    out->num_radiation = 0;
+    out->num_wormholes = 0;
+    out->original_input_size = 0;
     out->singularity = (uint8_t *)malloc(sz);
     if (!out->singularity) return QTSQ_ERR_ALLOC;
     out->singularity_size = (uint32_t)sz;
@@ -244,21 +270,55 @@ int qtsq_shamir_reconstruct(const qtsq_context_t *shares, uint8_t k,
         out->singularity[pos] = lagrange_at_zero(xs, ys, k);
     }
 
-    /* Phase 2c: Integrity check - verify reconstructed secret matches the
-     * full 32-byte commitment (M4 fix: was only 4 bytes → 1-in-4-billion
-     * forgery probability). dimensions[7] = bytes 0-3, encoding = bytes 4-31. */
-    uint8_t expected_commitment[32];
-    memcpy(expected_commitment, &shares[0].schema.dimensions[7], 4);
-    memcpy(expected_commitment + 4, shares[0].schema.encoding, 28);
+    /* Integrity check, two generations:
+     *
+     *  - New (H-9): dimensions[7] + encoding hold SHA3-256 of the share's
+     *    OWN bytes, verified per share before interpolation above.
+     *  - Legacy: the same 32 bytes held SHA3-256(secret) (the pre-fix
+     *    commitment). Those files still reconstruct; the check runs on the
+     *    reconstructed bytes exactly as before.
+     *
+     * Distinguish by recomputing the self-digest of share 0: it matches
+     * only for new-format shares. A legacy share can never collide. */
+    uint8_t self_digest[32], embedded[32];
+    sha3_256(self_digest, shares[0].singularity, sz);
+    memcpy(embedded, &shares[0].schema.dimensions[7], 4);
+    memcpy(embedded + 4, shares[0].schema.encoding, 28);
+    int is_self_checked = memcmp(self_digest, embedded, 32) == 0;
+    memset(self_digest, 0, sizeof(self_digest));
+    memset(embedded, 0, sizeof(embedded));
 
-    uint8_t actual_commitment[32];
-    sha3_256(actual_commitment, out->singularity, sz);
+    if (is_self_checked) {
+        /* Verify every share before trusting the interpolation result. */
+        for (uint8_t i = 0; i < k; i++) {
+            uint8_t d[32], e[32];
+            sha3_256(d, shares[i].singularity, sz);
+            memcpy(e, &shares[i].schema.dimensions[7], 4);
+            memcpy(e + 4, shares[i].schema.encoding, 28);
+            int ok = memcmp(d, e, 32) == 0;
+            memset(d, 0, sizeof(d));
+            memset(e, 0, sizeof(e));
+            if (!ok) {
+                free(out->singularity);
+                out->singularity = NULL;
+                return QTSQ_ERR_CHECKSUM;
+            }
+        }
+    } else {
+        /* Legacy secret commitment (see H-9): still verified. */
+        uint8_t expected_commitment[32];
+        memcpy(expected_commitment, &shares[0].schema.dimensions[7], 4);
+        memcpy(expected_commitment + 4, shares[0].schema.encoding, 28);
 
-    if (memcmp(expected_commitment, actual_commitment, 32) != 0) {
-        /* Integrity check failed - forged or corrupted shares */
-        free(out->singularity);
-        out->singularity = NULL;
-        return QTSQ_ERR_CHECKSUM;  /* Use checksum error to indicate integrity failure */
+        uint8_t actual_commitment[32];
+        sha3_256(actual_commitment, out->singularity, sz);
+
+        if (memcmp(expected_commitment, actual_commitment, 32) != 0) {
+            /* Integrity check failed - forged or corrupted shares */
+            free(out->singularity);
+            out->singularity = NULL;
+            return QTSQ_ERR_CHECKSUM;
+        }
     }
 
     return QTSQ_OK;

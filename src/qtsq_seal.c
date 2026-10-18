@@ -17,6 +17,7 @@
 #include "qtsq_seal_freqdct.h"
 #include "../crypto/common/fips202.h"
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include "../crypto/ml-dsa-65/api.h"
 #include <stdlib.h>
 #include <string.h>
@@ -511,13 +512,25 @@ int qtsq_seal_authorship(qtsq_context_t *ctx,
     uint8_t verification_secret[32];
     derive_verification_secret(&token, verification_secret);
 
-    /* 3. Shamir split of the secret (3-of-5), GF(256), CSPRNG coeffs —
-     *    deterministic coeffs would destroy the information-theoretic
-     *    guarantee (attacker with K-1 shares could verify candidates). */
+    /* 3. Shamir split of the check value (3-of-5), GF(256), CSPRNG coeffs.
+     *
+     *    Scope, stated honestly (H-10): the split value is derived from
+     *    the token's PUBLIC identity fields (see derive_verification_secret
+     *    above), so it is recomputable by anyone holding the token and is
+     *    not a confidentiality boundary. All shares also travel inside the
+     *    same envelope, so the threshold does not force an adversary to
+     *    collect K independent fragments. What K-of-N measures here is
+     *    MARK SURVIVAL — how many embedding domains (header, frequency,
+     *    geometry, in-envelope markers) survived stripping and re-encoding
+     *    — and what proves authenticity is the ML-DSA-65 signature over
+     *    the token, checked independently. CSPRNG coefficients keep a K-1
+     *    subset from interpolating the check value, so a partially
+     *    stripped file cannot be "repaired" into a false verify. */
     uint8_t shares[QTSQ_SEAL_SHAMIR_N][32];
     {
         uint8_t coeffs[32][QTSQ_SEAL_SHAMIR_K - 1]; /* [byte][coeff_index] */
-        randombytes((uint8_t *)coeffs, sizeof(coeffs));
+        if (qtsq_random_bytes((uint8_t *)coeffs, sizeof(coeffs)) != 0)
+            return QTSQ_ERR_RANDOM;
 
         for (int i = 0; i < QTSQ_SEAL_SHAMIR_N; i++) {
             uint8_t x = (uint8_t)(i + 1); /* x = 1..N (never 0: f(0) = secret) */
@@ -569,7 +582,7 @@ int qtsq_seal_authorship(qtsq_context_t *ctx,
              * marker fallback (step 8), keeping K-of-N intact. */
             if (w && h && needed > 0 && needed <= 256u * 256u * 4u &&
                 pix_size == needed) {
-                if (qtsq_seal_embed_freq_dct(pix, w, h, ch, shares[1]) > 0) {
+                if (qtsq_seal_embed_freq_dct(pix, pix_size, w, h, ch, shares[1]) > 0) {
                     /* Re-encode over the singularity with the same codec. */
                     int prc = qtsq_compress_pixel(ctx, pix, w, h, ch,
                                                   QTSQ_PIXEL_COMPRESS_ZLIB);
@@ -800,7 +813,7 @@ int qtsq_verify_authorship(const qtsq_context_t *ctx,
                 if (w > 0 && h > 0 && need > 0 && need <= 256u * 256u * 4u &&
                     pix_size == need && !(seen_x & (1u << 1))) {
                     uint8_t extracted[32] = {0};
-                    if (qtsq_seal_extract_freq_dct(pix, w, h, ch, extracted) == 32) {
+                    if (qtsq_seal_extract_freq_dct(pix, pix_size, w, h, ch, extracted) == 32) {
                         out->domains_ok |= QTSQ_SEAL_DOMAIN_FREQUENCY;
                         memcpy(recovered_shares[shares_found], extracted, 32);
                         share_x[shares_found] = 2;

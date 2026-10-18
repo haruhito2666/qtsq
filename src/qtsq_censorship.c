@@ -11,9 +11,23 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/random.h>             /* getrandom(), 3.17+ */
+#endif
 #include "qtsq.h"
 #include "qtsq_sanitize.h"
 #include "../crypto/common/aes.h"   /* PQClean constant-time AES-256-CTR */
+
+/* M-6: aes256_ctx_release() free()s the expanded key schedule WITHOUT
+ * wiping it, and zeroing the context struct afterwards only clears a
+ * dangling pointer. Wipe the schedule first, then release. */
+static void aes256_release_wipe(aes256ctx *r) {
+    if (r->sk_exp)
+        qtsq_secure_zero(r->sk_exp, sizeof(uint64_t) * PQC_AES256_STATESIZE);
+    aes256_ctx_release(r);
+    qtsq_secure_zero(r, sizeof(*r));
+}
+#include "../crypto/argon2/argon2.h"
 
 /* ── CTR mode (Counter) for streaming encryption ──
  *
@@ -22,8 +36,8 @@
  * channels. We now delegate to the vendored PQClean aes256_ctr, which is
  * constant-time and table-free. The local function keeps the same
  * (in, out, size, key, iv) signature the callers already use. */
-static void aes256_ctr_local(const uint8_t *in, uint8_t *out, size_t size,
-                             const uint8_t key[32], const uint8_t iv[16]) {
+static int aes256_ctr_local(const uint8_t *in, uint8_t *out, size_t size,
+                            const uint8_t key[32], const uint8_t iv[16]) {
     aes256ctx aes;
     aes256_ctr_keyexp(&aes, key);
 
@@ -31,10 +45,11 @@ static void aes256_ctr_local(const uint8_t *in, uint8_t *out, size_t size,
      * input. Generate the keystream and XOR in-place. */
     uint8_t *keystream = (uint8_t *)malloc(size);
     if (!keystream) {
-        /* Allocation failure — caller will see unmodified output, but this
-         * path is only reached under memory pressure. */
-        aes256_ctx_release(&aes);
-        return;
+        /* M-2 sibling: returning "success" with `out` untouched would make
+         * encrypt() store uninitialised bytes (it copies from `out`) under
+         * a QTSQ_OK. Propagate instead. */
+        aes256_release_wipe(&aes);
+        return QTSQ_ERR_ALLOC;
     }
     aes256_ctr(keystream, size, iv, &aes);
     for (size_t i = 0; i < size; i++) {
@@ -43,19 +58,33 @@ static void aes256_ctr_local(const uint8_t *in, uint8_t *out, size_t size,
 
     qtsq_secure_zero(keystream, size);
     free(keystream);
-    aes256_ctx_release(&aes);
-    qtsq_secure_zero(&aes, sizeof(aes));
+    aes256_release_wipe(&aes);
+    return QTSQ_OK;
 }
 
-/* ── PBKDF2-like key derivation (SHA-256 based) ── */
+/* ── Password key derivation ──
+ *
+ * New files use Argon2id (H-8 fix). The `iterations` field used to carry a
+ * raw loop count for a home-made iterated-SHA256 KDF whose 256-byte buffer
+ * silently truncated passwords at 240 bytes, so two distinct long
+ * passwords derived the same key. It is now a KDF selector: files written
+ * with the selector value below use Argon2id over the full password; any
+ * other value is a legacy iteration count and decodes through the old KDF
+ * so pre-fix files keep working. The selector is deliberately small: an
+ * old reader that deserialises a new file runs the legacy loop only a
+ * couple of times and then fails the auth tag cleanly, instead of
+ * grinding through billions of SHA-256 rounds. */
+#define QTSQ_CENSORSHIP_KDF_ARGON2 1
 
-static void derive_key(const char *password, const uint8_t salt[16],
-                        uint32_t iterations, uint8_t key[32]) {
-    /* Simple iterative hash: key = SHA256(SHA256(...SHA256(password + salt))) */
+static void derive_key_legacy(const char *password, const uint8_t salt[16],
+                              uint32_t iterations, uint8_t key[32]) {
+    /* Iterative hash: key = SHA256(SHA256(...SHA256(password + salt))) */
     uint8_t buf[256];
     size_t pw_len = strlen(password);
     /* Clamp pw_len so the salt write stays in-bounds: we need pw_len + 16
-     * ≤ sizeof(buf). Without this, a password ≥ 241 bytes overflows buf. */
+     * ≤ sizeof(buf). Without this, a password ≥ 241 bytes overflows buf.
+     * (The truncation is a defect in this legacy KDF itself; new files no
+     * longer reach this code.) */
     if (pw_len > sizeof(buf) - 16) pw_len = sizeof(buf) - 16;
     size_t buf_len = pw_len + 16;
 
@@ -74,13 +103,42 @@ static void derive_key(const char *password, const uint8_t salt[16],
     qtsq_secure_zero(buf, sizeof(buf));
 }
 
+static int derive_key(const char *password, const uint8_t salt[16],
+                      uint32_t iterations, uint8_t key[32]) {
+    if (iterations == QTSQ_CENSORSHIP_KDF_ARGON2) {
+        int ret = argon2id_hash_raw(3, 65536, 4,
+                                    password, strlen(password),
+                                    salt, 16,
+                                    key, 32);
+        if (ret != ARGON2_OK) {
+            /* Never fall back to a predictable key on allocation failure:
+             * the caller would seal data under a key anyone can derive. */
+            memset(key, 0, 32);
+            return QTSQ_ERR_ALLOC;
+        }
+        return QTSQ_OK;
+    }
+    derive_key_legacy(password, salt, iterations, key);
+    return QTSQ_OK;
+}
+
 /* ── Cryptographically secure random bytes ── */
 
 static void generate_random_bytes(uint8_t *out, size_t len) {
 #if defined(__APPLE__)
     /* arc4random_buf is seeded by the OS kernel — CSPRNG, no setup needed */
     arc4random_buf(out, len);
-#elif defined(__linux__) || defined(__unix__) || defined(__EMSCRIPTEN__)
+#elif defined(__linux__) || defined(__ANDROID__) || defined(__unix__) || defined(__EMSCRIPTEN__)
+    /* Prefer getrandom() on Linux/Android: no file descriptor, no path. */
+    #if defined(__linux__) || defined(__ANDROID__)
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = getrandom(out + got, len - got, 0);
+        if (r <= 0) break;  /* EINTR or unavailable -> try /dev/urandom */
+        got += (size_t)r;
+    }
+    if (got == len) return;
+    #endif
     /* /dev/urandom is the correct POSIX source.
      * On Emscripten, the C runtime maps this to crypto.getRandomValues(). */
     FILE *f = fopen("/dev/urandom", "rb");
@@ -89,16 +147,16 @@ static void generate_random_bytes(uint8_t *out, size_t len) {
         fclose(f);
         if (rd == len) return;
     }
-    /* Fallback if /dev/urandom fails: use getrandom() syscall on Linux 3.17+ */
-    #if defined(__linux__) && !defined(__ANDROID__)
-    #include <sys/random.h>
-    getrandom(out, len, 0);
-    return;
-    #endif
+    /* H-7: this used to be a void function that simply fell off the end on
+     * Android/Emscripten, leaving the IV and salt as uninitialised memory
+     * that then encrypted the payload under QTSQ_OK. An RNG that cannot
+     * produce randomness must not produce output at all. */
+    abort();
 #elif defined(_WIN32)
     #include <bcrypt.h>
-    BCryptGenRandom(NULL, out, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    return;
+    NTSTATUS st = BCryptGenRandom(NULL, out, (ULONG)len,
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st < 0) abort();
 #else
     /* Hard abort — never ship encrypted files with a broken RNG */
     #error "No CSPRNG available for this platform. Add platform support before enabling encryption."
@@ -118,8 +176,8 @@ static void generate_random_bytes(uint8_t *out, size_t len) {
  * the inner hash result, which is opaque to the attacker.
  */
 
-static void compute_auth_tag(const uint8_t *ciphertext, size_t size,
-                              const uint8_t key[32], uint8_t tag[16]) {
+static int compute_auth_tag(const uint8_t *ciphertext, size_t size,
+                            const uint8_t key[32], uint8_t tag[16]) {
     const size_t BLOCK_SIZE = 64; /* SHA-256 block size */
     uint8_t ipad[64], opad[64];
     uint8_t inner_hash[32];
@@ -137,7 +195,12 @@ static void compute_auth_tag(const uint8_t *ciphertext, size_t size,
      * We compute it in two passes: first hash ipad block, then extend with ciphertext.
      * Since qtsq_sha256 takes a single contiguous buffer, allocate one. */
     uint8_t *inner_buf = (uint8_t *)malloc(BLOCK_SIZE + size);
-    if (!inner_buf) { qtsq_secure_zero(tag, 16); return; }
+    if (!inner_buf) {
+        /* M-2: an all-zero tag plus QTSQ_OK would seal a file nothing can
+         * ever decrypt (the written tag is part of the file). Propagate. */
+        qtsq_secure_zero(tag, 16);
+        return QTSQ_ERR_ALLOC;
+    }
     memcpy(inner_buf, ipad, BLOCK_SIZE);
     memcpy(inner_buf + BLOCK_SIZE, ciphertext, size);
     qtsq_sha256(inner_buf, BLOCK_SIZE + size, inner_hash);
@@ -156,6 +219,7 @@ static void compute_auth_tag(const uint8_t *ciphertext, size_t size,
     qtsq_secure_zero(opad, 64);
     qtsq_secure_zero(inner_hash, 32);
     qtsq_secure_zero(outer_hash, 32);
+    return QTSQ_OK;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -170,23 +234,38 @@ int qtsq_encrypt(qtsq_context_t *ctx, const char *password) {
     /* Generate random IV and salt */
     generate_random_bytes(ctx->censorship.iv, 16);
     generate_random_bytes(ctx->censorship.salt, 16);
-    ctx->censorship.iterations = 100000;
+    ctx->censorship.iterations = QTSQ_CENSORSHIP_KDF_ARGON2;
 
     /* Derive AES-256 key from password */
     uint8_t key[32];
-    derive_key(password, ctx->censorship.salt,
-               ctx->censorship.iterations, key);
+    int kdf = derive_key(password, ctx->censorship.salt,
+                         ctx->censorship.iterations, key);
+    if (kdf != QTSQ_OK) {
+        qtsq_secure_zero(key, 32);
+        return kdf;
+    }
 
     /* Encrypt singularity data in-place using CTR mode */
     uint8_t *ciphertext = (uint8_t *)malloc(ctx->singularity_size);
     if (!ciphertext) { qtsq_secure_zero(key, 32); return QTSQ_ERR_ALLOC; }
 
-    aes256_ctr_local(ctx->singularity, ciphertext, ctx->singularity_size,
-                     key, ctx->censorship.iv);
+    int ctr_rc = aes256_ctr_local(ctx->singularity, ciphertext,
+                                  ctx->singularity_size,
+                                  key, ctx->censorship.iv);
+    if (ctr_rc != QTSQ_OK) {
+        free(ciphertext);
+        qtsq_secure_zero(key, 32);
+        return ctr_rc;
+    }
 
     /* Compute authentication tag */
-    compute_auth_tag(ciphertext, ctx->singularity_size, key,
-                     ctx->censorship.auth_tag);
+    int tag_rc = compute_auth_tag(ciphertext, ctx->singularity_size, key,
+                                  ctx->censorship.auth_tag);
+    if (tag_rc != QTSQ_OK) {
+        free(ciphertext);
+        qtsq_secure_zero(key, 32);
+        return tag_rc;
+    }
 
     /* Replace singularity with ciphertext */
     memcpy(ctx->singularity, ciphertext, ctx->singularity_size);
@@ -220,16 +299,24 @@ int qtsq_decrypt(qtsq_context_t *ctx, const char *password) {
     if (!ctx->is_encrypted) return QTSQ_OK; /* not encrypted */
     if (!ctx->singularity || ctx->singularity_size == 0) return QTSQ_ERR_FORMAT;
 
-    /* Derive key from password */
+    /* Derive key from password (Argon2id, or the legacy iterated
+     * SHA-256 for files written before the H-8 fix) */
     uint8_t key[32];
-    derive_key(password, ctx->censorship.salt,
-               ctx->censorship.iterations, key);
+    int kdf = derive_key(password, ctx->censorship.salt,
+                         ctx->censorship.iterations, key);
+    if (kdf != QTSQ_OK) {
+        qtsq_secure_zero(key, 32);
+        return kdf;
+    }
 
     /* Verify authentication tag before decrypting.
      * CRYPT-2 FIX: use constant-time comparison — see ct_memcmp() above. */
     uint8_t computed_tag[16];
-    compute_auth_tag(ctx->singularity, ctx->singularity_size,
-                     key, computed_tag);
+    if (compute_auth_tag(ctx->singularity, ctx->singularity_size,
+                         key, computed_tag) != QTSQ_OK) {
+        qtsq_secure_zero(key, 32);
+        return QTSQ_ERR_ALLOC;
+    }
 
     if (ct_memcmp(computed_tag, ctx->censorship.auth_tag, 16) != 0) {
         qtsq_secure_zero(key, 32);
@@ -240,8 +327,14 @@ int qtsq_decrypt(qtsq_context_t *ctx, const char *password) {
     uint8_t *plaintext = (uint8_t *)malloc(ctx->singularity_size);
     if (!plaintext) { qtsq_secure_zero(key, 32); return QTSQ_ERR_ALLOC; }
 
-    aes256_ctr_local(ctx->singularity, plaintext, ctx->singularity_size,
-                     key, ctx->censorship.iv);
+    int ctr_rc = aes256_ctr_local(ctx->singularity, plaintext,
+                                  ctx->singularity_size,
+                                  key, ctx->censorship.iv);
+    if (ctr_rc != QTSQ_OK) {
+        free(plaintext);
+        qtsq_secure_zero(key, 32);
+        return ctr_rc;
+    }
 
     memcpy(ctx->singularity, plaintext, ctx->singularity_size);
     free(plaintext);

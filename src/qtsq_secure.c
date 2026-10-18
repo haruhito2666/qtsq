@@ -105,8 +105,13 @@ int qtsq_secure_image(qtsq_context_t *ctx,
                       const uint8_t *sign_sk) {
     if (!ctx || !pixels) return QTSQ_ERR_NULL;
     
-    /* Phase 3a: Store original input for Provenance signing */
-    uint32_t raw_size = w * h * ch;
+    /* Phase 3a: Store original input for Provenance signing.
+     * M-1: the product was computed in uint32_t, so e.g. 65536x65536x3
+     * wrapped to 0: malloc(0) then a full-width memcpy. Compute in
+     * size_t and reject impossible geometry. */
+    if (w == 0 || h == 0 || ch == 0) return QTSQ_ERR_FORMAT;
+    size_t raw_size = (size_t)w * (size_t)h * (size_t)ch;
+    if (raw_size / w / h != ch) return QTSQ_ERR_TOO_LARGE;
     if (ctx->intent == QTSQ_INTENT_PROVENANCE) {
         /* Provenance: sign the original pixel buffer (after sanitize, before compression) */
         int res = qtsq_set_original_input(ctx, pixels, raw_size);

@@ -9,6 +9,12 @@
  * Region metadata is stored in schema.encoding as a compact binary
  * blob prefixed with "REGC".
  *
+ * M-12 (accepted, documented): this is a stream-XOR construction with no
+ * MAC. Anyone who can modify the file can flip chosen bits of the
+ * decrypted splat data, and a reader cannot detect it. Region output is
+ * confidential only when wrapped in an authenticated layer (the vault
+ * envelope is Encrypt-then-MAC over the singularity). See FORMAT.md §8.
+ *
  * Author: Haruhito
  */
 

@@ -165,10 +165,14 @@ static uint8_t extract_block_bits(const double coeffs[64]) {
 
 /* ── Public API ── */
 
-int qtsq_seal_embed_freq_dct(uint8_t *pixels, uint32_t w, uint32_t h,
+int qtsq_seal_embed_freq_dct(uint8_t *pixels, size_t pixels_size,
+                              uint32_t w, uint32_t h,
                               uint8_t ch, const uint8_t share[32]) {
     if (!pixels || !share) return -1;
     if (ch < 1 || ch > 4) return -1;
+    /* M-11: without the buffer length there was no way to bounds-check the
+     * strided block writes below. */
+    if ((uint64_t)w * h * ch > pixels_size) return -1;
     uint32_t blocks_x = w / 8;
     uint32_t blocks_y = h / 8;
     if (blocks_x == 0 || blocks_y == 0) return -1;
@@ -206,10 +210,12 @@ int qtsq_seal_embed_freq_dct(uint8_t *pixels, uint32_t w, uint32_t h,
     return bytes_embedded;
 }
 
-int qtsq_seal_extract_freq_dct(const uint8_t *pixels, uint32_t w, uint32_t h,
+int qtsq_seal_extract_freq_dct(const uint8_t *pixels, size_t pixels_size,
+                                uint32_t w, uint32_t h,
                                 uint8_t ch, uint8_t out_share[32]) {
     if (!pixels || !out_share) return -1;
     if (ch < 1 || ch > 4) return -1;
+    if ((uint64_t)w * h * ch > pixels_size) return -1;
     uint32_t blocks_x = w / 8;
     uint32_t blocks_y = h / 8;
     if (blocks_x == 0 || blocks_y == 0) return -1;

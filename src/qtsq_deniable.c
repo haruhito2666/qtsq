@@ -23,8 +23,19 @@
 
 #include "qtsq_deniable.h"
 #include "qtsq.h"
+#include "qtsq_rng.h"
 #include "qtsq_sanitize.h"
 #include "../crypto/common/aes.h"
+
+/* M-6: aes256_ctx_release() free()s the expanded key schedule WITHOUT
+ * wiping it, and zeroing the context struct afterwards only clears a
+ * dangling pointer. Wipe the schedule first, then release. */
+static void aes256_release_wipe(aes256ctx *r) {
+    if (r->sk_exp)
+        qtsq_secure_zero(r->sk_exp, sizeof(uint64_t) * PQC_AES256_STATESIZE);
+    aes256_ctx_release(r);
+    qtsq_secure_zero(r, sizeof(*r));
+}
 #include "../crypto/common/fips202.h"
 #include "../crypto/common/randombytes.h"
 #include "../crypto/argon2/argon2.h"
@@ -59,7 +70,7 @@ static void aes_ctr_stream(const uint8_t key[32], const uint8_t nonce[12],
     aes256ctx aes;
     aes256_ctr_keyexp(&aes, key);
     aes256_ctr(out, len, iv, &aes);
-    aes256_ctx_release(&aes);
+    aes256_release_wipe(&aes);
     /* XOR with plaintext */
     for (size_t i = 0; i < len; i++) out[i] ^= in[i];
 }
@@ -104,15 +115,22 @@ int qtsq_deniable_encrypt(qtsq_context_t *ctx,
     if (!ctx || !real_data || !decoy_data || !real_password || !decoy_password) return QTSQ_ERR_NULL;
     if (real_size == 0 || decoy_size == 0) return QTSQ_ERR_TOO_SMALL;
 
-    size_t P = (real_size > decoy_size ? real_size : decoy_size) * 2 + 128;
+    /* M-7: overflow check — a wrapped P would malloc small while the
+     * envelope write below still uses the unwrapped offsets. */
+    size_t maxsz = real_size > decoy_size ? real_size : decoy_size;
+    if (maxsz > (SIZE_MAX - 128) / 2) return QTSQ_ERR_TOO_LARGE;
+    size_t P = maxsz * 2 + 128;
 
     uint8_t *payload = (uint8_t *)malloc(P);
     if (!payload) return QTSQ_ERR_ALLOC;
-    randombytes(payload, P); 
-
     deniable_hdr_t hdr;
-    randombytes(hdr.salt_A, 32);
-    randombytes(hdr.salt_B, 32);
+    /* M-5: refuse to build an envelope with a zeroed/partial CSPRNG draw. */
+    if (qtsq_random_bytes(payload, P) != 0 ||
+        qtsq_random_bytes(hdr.salt_A, 32) != 0 ||
+        qtsq_random_bytes(hdr.salt_B, 32) != 0) {
+        free(payload);
+        return QTSQ_ERR_RANDOM;
+    }
 
     uint8_t key_A[32], key_B[32];
     deniable_kdf(real_password, hdr.salt_A, DEN_ITERS, key_A);
@@ -141,6 +159,7 @@ int qtsq_deniable_encrypt(qtsq_context_t *ctx,
     free(real_env);
 
     size_t total = DEN_HDR_SIZE + P;
+    if (total > UINT32_MAX) return QTSQ_ERR_TOO_LARGE; /* context sizes are 32-bit */
     uint8_t *singularity = (uint8_t *)malloc(total);
     memcpy(singularity, &hdr, DEN_HDR_SIZE);
     memcpy(singularity + DEN_HDR_SIZE, payload, P);

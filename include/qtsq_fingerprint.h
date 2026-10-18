@@ -56,6 +56,8 @@ int qtsq_fingerprint_embed(splat2d_t *splats, uint32_t count,
  * @param width             Image width
  * @param height            Image height
  * @param suspect_pixels    Suspect image (decoded to raw RGB pixels)
+ * @param suspect_size      Bytes valid at suspect_pixels (must cover
+ *                          width*height*channels)
  * @param channels          Number of channels (typically 3)
  * @param master_key        32-byte distributor master key
  * @param candidate_ids     Array of candidate recipient IDs to test
@@ -66,7 +68,8 @@ int qtsq_fingerprint_embed(splat2d_t *splats, uint32_t count,
  */
 int qtsq_fingerprint_extract(const splat2d_t *original_splats, uint32_t count,
                               uint32_t width, uint32_t height,
-                              const uint8_t *suspect_pixels, uint8_t channels,
+                              const uint8_t *suspect_pixels, size_t suspect_size,
+                              uint8_t channels,
                               const uint8_t master_key[32],
                               const uint8_t candidate_ids[][32],
                               uint32_t num_candidates,

@@ -69,7 +69,10 @@ typedef struct {
  *
  * 1. Builds an authorship token from the provided metadata
  * 2. Signs it with ML-DSA-65 (the author's signing key)
- * 3. Splits a verification secret with Shamir K-of-N
+ * 3. Splits a check value with Shamir K-of-N. The value derives from the
+ *    token's public identity fields (H-10): the threshold measures how
+ *    many embedding domains survived editing, not secrecy — authenticity
+ *    is the ML-DSA-65 signature. Never treat the shares as confidential.
  * 4. Embeds shares in multiple domains:
  *    - Share 0: header signature block (in security block)
  *    - Share 1: frequency domain (DCT coefficients of image data)

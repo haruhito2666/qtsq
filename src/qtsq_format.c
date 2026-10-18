@@ -403,6 +403,16 @@ int qtsq_read(qtsq_context_t *ctx, const char *filename) {
         memset(&ctx->security, 0, sizeof(qtsq_security_block_t));
         if (fread(&ctx->security, ctx->header.security_block_size, 1, f) == 1) {
             ctx->has_security = 1;
+            /* H-5: the ENCRYPTED header flags are not covered by anything
+             * checkable before the key is known, so clearing a bit must not
+             * demote a sealed file to "plaintext". The security block's
+             * encryption_type is independent evidence of a sealed payload;
+             * believing it errs toward asking for a password (an error) and
+             * never toward serving ciphertext as content. */
+            if (!ctx->is_encrypted &&
+                ctx->security.encryption_type >= 1 && ctx->security.encryption_type <= 3) {
+                ctx->is_encrypted = 1;
+            }
         }
     } else if (ctx->is_encrypted) {
         /* Read legacy censorship metadata if encrypted (V1/V2/V3 legacy path) */

@@ -18,11 +18,22 @@
 #include <sys/mman.h>
 #endif
 #include "qtsq.h"
+#include "qtsq_rng.h"
 #include "qtsq_vault.h"
 #include "qtsq_sanitize.h"
 #include "qtsq_codec.h"
 #include "../crypto/common/randombytes.h"
 #include "../crypto/common/aes.h"
+
+/* M-6: aes256_ctx_release() free()s the expanded key schedule WITHOUT
+ * wiping it, and zeroing the context struct afterwards only clears a
+ * dangling pointer. Wipe the schedule first, then release. */
+static void aes256_release_wipe(aes256ctx *r) {
+    if (r->sk_exp)
+        qtsq_secure_zero(r->sk_exp, sizeof(uint64_t) * PQC_AES256_STATESIZE);
+    aes256_ctx_release(r);
+    qtsq_secure_zero(r, sizeof(*r));
+}
 #include "../crypto/common/fips202.h"
 #include "../crypto/ml-kem-768/api.h"
 
@@ -328,6 +339,21 @@ static void free_builder(container_builder_t *b) {
     free(b);
 }
 
+/* M-14: detach and free the builder. MUST be used on every error path
+ * that frees the builder, and by qtsq_free(): leaving the tag blob in
+ * ctx->singularity after free_builder() leaves a dangling builder pointer
+ * that the next add_* or qtsq_free would follow. Also frees the tag blob
+ * itself so the caller's context owns nothing. */
+void qtsq_container_abandon(qtsq_context_t *ctx) {
+    container_builder_t *b = get_builder(ctx);
+    if (!b) return;
+    free_builder(b);
+    free(ctx->singularity);
+    ctx->singularity = NULL;
+    ctx->singularity_size = 0;
+}
+
+
 /* ══════════════════════════════════════════════════════════════
  *  PUBLIC: qtsq_container_add_raw — borrowed zero-copy stream
  *
@@ -576,8 +602,10 @@ int qtsq_container_pack(qtsq_context_t *ctx) {
      * and stream names were written in cleartext (the entire Phase 5
      * feature was dead code). The vault preserves this salt. */
     if (!ctx->has_security) {
-        randombytes(ctx->security.salt, 32);
-        randombytes(ctx->security.nonce, 12);
+        /* M-5: fail closed on CSPRNG failure instead of writing a zeroed salt. */
+        if (qtsq_random_bytes(ctx->security.salt, 32) != 0 ||
+            qtsq_random_bytes(ctx->security.nonce, 12) != 0)
+            return QTSQ_ERR_RANDOM;
         ctx->security.security_version = 1;
         ctx->security.encryption_type = 1; /* tentatively password; vault will refine */
         ctx->has_security = 1;
@@ -656,14 +684,14 @@ int qtsq_container_pack(qtsq_context_t *ctx) {
                 pos += b->streams[i].rhead_len;
             }
             if (b->streams[i].rdata_len > 0) {
-                if (!b->streams[i].rdata) { free(buf); free_builder(b); return QTSQ_ERR_FORMAT; }
+                if (!b->streams[i].rdata) { free(buf); qtsq_container_abandon(ctx); return QTSQ_ERR_FORMAT; }
                 memcpy(buf + pos, b->streams[i].rdata, b->streams[i].rdata_len);
                 pos += b->streams[i].rdata_len;
             }
             if (b->streams[i].rhead_len + b->streams[i].rdata_len !=
                 (size_t)b->streams[i].entry.data_size) {
                 free(buf);
-                free_builder(b);
+                qtsq_container_abandon(ctx);
                 return QTSQ_ERR_FORMAT;
             }
         }
@@ -946,6 +974,9 @@ int qtsq_container_get_count(const qtsq_context_t *ctx, uint32_t *out_count) {
 
     /* Read from packed buffer */
     memcpy(out_count, ctx->singularity, 4);
+    /* M-13: the count is attacker-controlled; a crafted value must not
+     * reach callers as a loop bound. */
+    if (*out_count > QTSQ_MAX_STREAMS) return QTSQ_ERR_FORMAT;
     return QTSQ_OK;
 }
 
@@ -960,7 +991,7 @@ static size_t container_stream_name(const qtsq_context_t *ctx,
                                     uint32_t num_streams, uint32_t index,
                                     const qtsq_stream_entry_t *entry,
                                     char *name_buf, size_t name_buf_size) {
-    size_t data_block_start = 4 + num_streams * sizeof(qtsq_stream_entry_t);
+    size_t data_block_start = 4 + (size_t)num_streams * sizeof(qtsq_stream_entry_t);
     size_t stream_start = data_block_start + entry->data_offset;
 
     if (stream_start >= total_size) return 0;
@@ -1037,9 +1068,12 @@ int qtsq_container_get_stream_name(const qtsq_context_t *ctx, uint32_t index,
 
     uint32_t num_streams;
     memcpy(&num_streams, buf, 4);
+    /* M-13: attacker-controlled count; bound it before any
+     * num_streams * sizeof(entry) arithmetic. */
+    if (num_streams > QTSQ_MAX_STREAMS) return QTSQ_ERR_FORMAT;
     if (index >= num_streams) return QTSQ_ERR_FORMAT;
 
-    size_t toc_offset = 4 + index * sizeof(qtsq_stream_entry_t);
+    size_t toc_offset = 4 + (size_t)index * sizeof(qtsq_stream_entry_t);
     if (toc_offset + sizeof(qtsq_stream_entry_t) > total_size) return QTSQ_ERR_FORMAT;
 
     qtsq_stream_entry_t entry;
@@ -1107,17 +1141,20 @@ int qtsq_container_get_stream(const qtsq_context_t *ctx, uint32_t index,
 
     uint32_t num_streams;
     memcpy(&num_streams, buf, 4);
+    /* M-13: attacker-controlled count; bound it before any
+     * num_streams * sizeof(entry) arithmetic. */
+    if (num_streams > QTSQ_MAX_STREAMS) return QTSQ_ERR_FORMAT;
     if (index >= num_streams) return QTSQ_ERR_FORMAT;
 
     /* Read TOC entry */
-    size_t toc_offset = 4 + index * sizeof(qtsq_stream_entry_t);
+    size_t toc_offset = 4 + (size_t)index * sizeof(qtsq_stream_entry_t);
     if (toc_offset + sizeof(qtsq_stream_entry_t) > total_size) return QTSQ_ERR_FORMAT;
 
     qtsq_stream_entry_t entry;
     memcpy(&entry, buf + toc_offset, sizeof(qtsq_stream_entry_t));
 
     /* Data block starts after TOC */
-    size_t data_block_start = 4 + num_streams * sizeof(qtsq_stream_entry_t);
+    size_t data_block_start = 4 + (size_t)num_streams * sizeof(qtsq_stream_entry_t);
     size_t stream_start = data_block_start + entry.data_offset;
 
     if (stream_start >= total_size) return QTSQ_ERR_FORMAT;
@@ -1178,15 +1215,16 @@ static int container_ctr_xor(uint8_t *payload, size_t len,
     if (len == 0) return 0;
     if (len > SIZE_MAX - 16) return 1;
 
-    uint8_t *keystream = (uint8_t *)malloc(len + 16);
-    if (!keystream) return 1;
-
     uint8_t iv[16] = {0};
     memcpy(iv, nonce, 12);
     aes256ctx aes;
     aes256_ctr_keyexp(&aes, key);
+
+    uint8_t *keystream = (uint8_t *)malloc(len + 16);
+    if (!keystream) { aes256_release_wipe(&aes); return 1; }
+
     aes256_ctr(keystream, len, iv, &aes);
-    aes256_ctx_release(&aes);
+    aes256_release_wipe(&aes);
 
     for (size_t i = 0; i < len; i++) payload[i] ^= keystream[i];
 
@@ -1244,6 +1282,9 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     const uint8_t *buf = ctx->singularity;
     uint32_t num_streams;
     memcpy(&num_streams, buf, 4);
+    /* M-13: attacker-controlled count; bound it before any
+     * num_streams * sizeof(entry) arithmetic. */
+    if (num_streams > QTSQ_MAX_STREAMS) return QTSQ_ERR_FORMAT;
     if (stream_index >= num_streams) return QTSQ_ERR_FORMAT;
 
     /* Locate the stream data in the packed buffer */
@@ -1254,7 +1295,7 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     qtsq_stream_entry_t entry;
     memcpy(&entry, buf + toc_offset, sizeof(qtsq_stream_entry_t));
 
-    size_t data_block_start = 4 + num_streams * sizeof(qtsq_stream_entry_t);
+    size_t data_block_start = 4 + (size_t)num_streams * sizeof(qtsq_stream_entry_t);
     size_t stream_start = data_block_start + entry.data_offset;
 
     /* Skip the name to find the payload.
@@ -1292,8 +1333,9 @@ int qtsq_container_encrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     memset(&enc, 0, sizeof(enc));
     enc.encryption_type = 2; /* PQ-KEM */
 
-    randombytes(enc.nonce, 12);
-    randombytes(enc.salt, 32);
+    if (qtsq_random_bytes(enc.nonce, 12) != 0 ||
+        qtsq_random_bytes(enc.salt, 32) != 0)
+        return QTSQ_ERR_RANDOM;
     enc.kem_ct_size = PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
 
     /* Encapsulate shared secret using recipient's public key */
@@ -1382,6 +1424,9 @@ int qtsq_container_decrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
     const uint8_t *buf = ctx->singularity;
     uint32_t num_streams;
     memcpy(&num_streams, buf, 4);
+    /* M-13: attacker-controlled count; bound it before any
+     * num_streams * sizeof(entry) arithmetic. */
+    if (num_streams > QTSQ_MAX_STREAMS) return QTSQ_ERR_FORMAT;
     if (stream_index >= num_streams) return QTSQ_ERR_FORMAT;
 
     /* Locate the stream data */
@@ -1394,7 +1439,7 @@ int qtsq_container_decrypt_stream(qtsq_context_t *ctx, uint32_t stream_index,
 
     if (!(entry.flags & QTSQ_STREAM_FLAG_ENCRYPTED)) return QTSQ_OK; /* already decrypted */
 
-    size_t data_block_start = 4 + num_streams * sizeof(qtsq_stream_entry_t);
+    size_t data_block_start = 4 + (size_t)num_streams * sizeof(qtsq_stream_entry_t);
     size_t stream_start = data_block_start + entry.data_offset;
 
     /* Skip the name to find the encryption header.

@@ -10,6 +10,36 @@
 #include <stdio.h>
 #include "qtsq.h"
 
+/* M-4: wormhole records are loaded from untrusted .qtsq files and carry a
+ * target path, so resolving one used to open whatever local file a crafted
+ * file named (and the path_hash "check" compared the path to its own hash
+ * -- worthless). Only paths this process registered -- via
+ * qtsq_add_wormhole or qtsq_wormhole_trust_path -- are opened. */
+#define QTSQ_WORMHOLE_MAX_TRUSTED 64
+static uint8_t  g_trusted_paths[QTSQ_WORMHOLE_MAX_TRUSTED][32];
+static uint32_t g_trusted_count = 0;
+
+static void trust_path(const char *path) {
+    uint8_t h[32];
+    qtsq_sha256((const uint8_t *)path, strlen(path), h);
+    for (uint32_t i = 0; i < g_trusted_count; i++)
+        if (memcmp(g_trusted_paths[i], h, 32) == 0) return;
+    if (g_trusted_count < QTSQ_WORMHOLE_MAX_TRUSTED)
+        memcpy(g_trusted_paths[g_trusted_count++], h, 32);
+}
+
+static int path_is_trusted(const char *path) {
+    uint8_t h[32];
+    qtsq_sha256((const uint8_t *)path, strlen(path), h);
+    for (uint32_t i = 0; i < g_trusted_count; i++)
+        if (memcmp(g_trusted_paths[i], h, 32) == 0) return 1;
+    return 0;
+}
+
+void qtsq_wormhole_trust_path(const char *path) {
+    if (path) trust_path(path);
+}
+
 /* ══════════════════════════════════════════════════════════════
  *  qtsq_add_wormhole — Add a reference to data in another file
  * ══════════════════════════════════════════════════════════════
@@ -48,6 +78,9 @@ int qtsq_add_wormhole(qtsq_context_t *ctx,
     qtsq_sha256((const uint8_t *)target_path, strlen(target_path),
                 wh->target_hash);
 
+    /* The caller named this path, so it is trusted for resolution. */
+    trust_path(target_path);
+
     ctx->num_wormholes = new_count;
     ctx->header.flags |= QTSQ_FLAG_HAS_WORMHOLES;
 
@@ -72,6 +105,9 @@ int qtsq_resolve_wormholes(qtsq_context_t *ctx) {
 
         /* Only resolve local wormholes (LAN/cloud would need network) */
         if (wh->type != QTSQ_WORMHOLE_LOCAL) continue;
+
+        /* M-4: never open a path that came out of a file. */
+        if (!path_is_trusted(wh->target_path)) return QTSQ_ERR_WORMHOLE;
 
         /* Open target file */
         qtsq_context_t target;
@@ -178,6 +214,9 @@ int qtsq_unpack_wormholes(qtsq_context_t *ctx, const uint8_t *buf, size_t size) 
     size_t pos = 4;
     for (uint32_t i = 0; i < count; i++) {
         memcpy(&ctx->wormholes[i], buf + pos, sizeof(qtsq_wormhole_t));
+        /* Force NUL termination: a crafted record can fill target_path
+         * completely and any later strlen() would run off the struct. */
+        ctx->wormholes[i].target_path[sizeof(ctx->wormholes[i].target_path) - 1] = '\0';
         pos += sizeof(qtsq_wormhole_t);
     }
 

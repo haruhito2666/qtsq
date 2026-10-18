@@ -10,7 +10,18 @@
 
 /* Relative includes to the vendored PQClean code */
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include "../crypto/common/aes.h"
+
+/* M-6: aes256_ctx_release() free()s the expanded key schedule WITHOUT
+ * wiping it, and zeroing the context struct afterwards only clears a
+ * dangling pointer. Wipe the schedule first, then release. */
+static void aes256_release_wipe(aes256ctx *r) {
+    if (r->sk_exp)
+        qtsq_secure_zero(r->sk_exp, sizeof(uint64_t) * PQC_AES256_STATESIZE);
+    aes256_ctx_release(r);
+    qtsq_secure_zero(r, sizeof(*r));
+}
 #include "../crypto/common/fips202.h"
 #include "../crypto/ml-kem-768/api.h"
 #include "../crypto/ml-dsa-65/api.h"
@@ -57,11 +68,13 @@ static void hmac_sha3_256(const uint8_t *key, size_t key_len,
 /* Argon2id password KDF (Phase 2a: replaced homemade iterated SHA3-256).
  * Default params: t_cost=3, m_cost=64MB, parallelism=4 — tuned for security
  * vs. acceptable interactive latency (~100-200ms on modern hardware). */
+#define QTSQ_ARGON2_T_COST 3
+
 static int derive_password_key(const char *password, const uint8_t salt[32],
                                 uint32_t iterations, uint8_t key[32]) {
     (void)iterations;  /* ignored; Argon2 cost is in t_cost/m_cost, not iteration count */
     
-    uint32_t t_cost = 3;            /* time cost (iterations) */
+    uint32_t t_cost = QTSQ_ARGON2_T_COST;   /* time cost (iterations) */
     uint32_t m_cost = 65536;        /* memory cost in KiB (64 MB) */
     uint32_t parallelism = 4;       /* number of threads/lanes */
     
@@ -117,15 +130,14 @@ static int vault_sym_encrypt(qtsq_context_t *ctx, const uint8_t key[32], const u
      * the caller must XOR it with the plaintext. Generate the keystream
      * into a temporary buffer and XOR in-place. */
     uint8_t *keystream = (uint8_t *)malloc(ctx->singularity_size);
-    if (!keystream) { aes256_ctx_release(&aes); qtsq_secure_zero(&aes, sizeof(aes)); qtsq_secure_zero(enc_key, 32); qtsq_secure_zero(mac_key, 32); return QTSQ_ERR_ALLOC; }
+    if (!keystream) { aes256_release_wipe(&aes); qtsq_secure_zero(enc_key, 32); qtsq_secure_zero(mac_key, 32); return QTSQ_ERR_ALLOC; }
     aes256_ctr(keystream, ctx->singularity_size, iv, &aes);
     for (size_t i = 0; i < ctx->singularity_size; i++) {
         ctx->singularity[i] ^= keystream[i];
     }
     qtsq_secure_zero(keystream, ctx->singularity_size);
     free(keystream);
-    aes256_ctx_release(&aes);
-    qtsq_secure_zero(&aes, sizeof(aes));
+    aes256_release_wipe(&aes);
     qtsq_secure_zero(enc_key, 32);
 
     /* Compute MAC: tag = HMAC-SHA3-256(mac_key, ciphertext) */
@@ -167,15 +179,14 @@ static int vault_sym_decrypt(qtsq_context_t *ctx, const uint8_t key[32], const u
     /* aes256_ctr() only emits the keystream; XOR it with the ciphertext
      * in-place to recover the plaintext. */
     uint8_t *keystream = (uint8_t *)malloc(ctx->singularity_size);
-    if (!keystream) { aes256_ctx_release(&aes); qtsq_secure_zero(&aes, sizeof(aes)); qtsq_secure_zero(enc_key, 32); return QTSQ_ERR_ALLOC; }
+    if (!keystream) { aes256_release_wipe(&aes); qtsq_secure_zero(enc_key, 32); return QTSQ_ERR_ALLOC; }
     aes256_ctr(keystream, ctx->singularity_size, iv, &aes);
     for (size_t i = 0; i < ctx->singularity_size; i++) {
         ctx->singularity[i] ^= keystream[i];
     }
     qtsq_secure_zero(keystream, ctx->singularity_size);
     free(keystream);
-    aes256_ctx_release(&aes);
-    qtsq_secure_zero(&aes, sizeof(aes));
+    aes256_release_wipe(&aes);
     qtsq_secure_zero(enc_key, 32);
     
     return QTSQ_OK;
@@ -195,7 +206,7 @@ int qtsq_sign_keygen(qtsq_sign_keypair_t *skp) {
 
 /* ═══ Encryption API ═══ */
 
-static void init_security_block(qtsq_context_t *ctx) {
+static int init_security_block(qtsq_context_t *ctx) {
     /* Preserve any salt that qtsq_container_pack pre-generated so the
      * container name-encryption key (derived from the salt) stays consistent
      * before and after the vault encrypts. Without this, pack sees
@@ -207,15 +218,35 @@ static void init_security_block(qtsq_context_t *ctx) {
 
     memset(&ctx->security, 0, sizeof(qtsq_security_block_t));
     ctx->security.security_version = 1;
-    randombytes(ctx->security.nonce, 12);
+    if (qtsq_random_bytes(ctx->security.nonce, 12) != 0) return QTSQ_ERR_RANDOM;
 
     if (has_salt) memcpy(ctx->security.salt, saved_salt, 32);
-    else randombytes(ctx->security.salt, 32);
+    else if (qtsq_random_bytes(ctx->security.salt, 32) != 0) return QTSQ_ERR_RANDOM;
+    return QTSQ_OK;
+}
+
+/* True when the security block itself carries encryption state. Used to
+ * fail closed when the header's ENCRYPTED flags have been cleared: the
+ * flags are not covered by a MAC that can be checked before the key is
+ * known, so a file edit that clears one bit must not turn a sealed file
+ * into one that "decrypts" to itself. */
+static int security_block_indicates_encryption(const qtsq_context_t *ctx) {
+    return ctx->has_security &&
+           ctx->security.encryption_type >= 1 && ctx->security.encryption_type <= 3;
 }
 
 int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
     if (!ctx || !password) return QTSQ_ERR_NULL;
     if (!ctx->singularity || ctx->singularity_size == 0) return QTSQ_ERR_FORMAT;
+
+    /* Refuse a second password layer. The nonce is per-file, so
+     * re-encrypting in place would reuse it under the same derived key:
+     * identical keystream, and encrypting the ciphertext again XORs that
+     * keystream straight back off -- the context would still claim to be
+     * encrypted while holding plaintext. Layering (PQ then password) is
+     * the one legal re-entry and arrives with encryption_type == 2. */
+    if (ctx->is_encrypted && ctx->security.encryption_type != 2)
+        return QTSQ_ERR_ENCRYPTED;
 
     /* Guarantee #1 (zero metadata): if the caller did not run a qtsq_secure_*
      * path (which sets is_sanitized after real LSB scrub + names-in-envelope),
@@ -233,7 +264,8 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
     int was_pq_encrypted = (ctx->is_encrypted && ctx->security.encryption_type == 2);
     
     if (!ctx->is_encrypted) {
-        init_security_block(ctx);
+        int rng = init_security_block(ctx);
+        if (rng != QTSQ_OK) return rng;
     }
     
     /* If layered, backup the PQ layer's auth_tag before password layer overwrites it */
@@ -244,16 +276,23 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
     
     /* Set encryption_type: 1=password-only, 3=layered(PQ+password) */
     ctx->security.encryption_type = was_pq_encrypted ? 3 : 1;
-    ctx->security.kdf_iterations = 100000;
+    /* M-8: this field used to claim 100000 while the actual KDF was
+     * Argon2id t=3, m=64 MiB, p=4 -- an on-disk lie. It now records the
+     * real Argon2 time cost. Readers still ignore it (the cost is fixed
+     * in the code, and honouring a file-controlled cost would be a DoS
+     * lever), so files written before this change keep working. */
+    ctx->security.kdf_iterations = QTSQ_ARGON2_T_COST;
 
     /* Generate new salt for password layer — unless qtsq_container_pack
      * already pre-generated one (preserving it keeps the name-encryption
      * key consistent with what pack used). */
     if (was_pq_encrypted) {
         /* Store password salt at offset 3277 in signature space */
-        randombytes(ctx->security.signature + 3277, 32);
+        if (qtsq_random_bytes(ctx->security.signature + 3277, 32) != 0)
+            return QTSQ_ERR_RANDOM;
     } else if (!ctx->has_security) {
-        randombytes(ctx->security.salt, 32);
+        if (qtsq_random_bytes(ctx->security.salt, 32) != 0)
+            return QTSQ_ERR_RANDOM;
     }
     ctx->has_security = 1;
     
@@ -276,7 +315,11 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
 
 int qtsq_vault_decrypt_password(qtsq_context_t *ctx, const char *password) {
     if (!ctx || !password) return QTSQ_ERR_NULL;
-    if (!ctx->is_encrypted) return QTSQ_OK;
+    if (!ctx->is_encrypted) {
+        /* Fail closed: a cleared flag is not a decryption. */
+        if (security_block_indicates_encryption(ctx)) return QTSQ_ERR_DECRYPT;
+        return QTSQ_OK;
+    }
     
     /* Phase 2b: handle both password-only (type=1) and layered (type=3) */
     if (ctx->security.encryption_type != 1 && ctx->security.encryption_type != 3) {
@@ -318,7 +361,13 @@ int qtsq_vault_decrypt_password(qtsq_context_t *ctx, const char *password) {
 int qtsq_vault_encrypt_pq(qtsq_context_t *ctx, const uint8_t recipient_pk[1184]) {
     if (!ctx || !recipient_pk) return QTSQ_ERR_NULL;
     if (!ctx->singularity || ctx->singularity_size == 0) return QTSQ_ERR_FORMAT;
-    /* Phase 2b: allow re-encryption for layering (removed early return) */
+
+    /* PQ is always the inner layer: the layered flow encrypts PQ first and
+     * then adds a password on top. A second PQ pass would re-init the
+     * security block -- overwriting the kem_ciphertext that is the only
+     * way back to the first layer -- and re-encrypt ciphertext with a
+     * fresh keystream, so it is refused rather than half-supported. */
+    if (ctx->is_encrypted) return QTSQ_ERR_ENCRYPTED;
 
     /* Guarantee #1 (zero metadata): same floor as the password path —
      * move names inside the envelope before encryption. */
@@ -327,7 +376,10 @@ int qtsq_vault_encrypt_pq(qtsq_context_t *ctx, const uint8_t recipient_pk[1184])
         if (san != QTSQ_OK) return san;
     }
 
-    init_security_block(ctx);
+    {
+        int rng = init_security_block(ctx);
+        if (rng != QTSQ_OK) return rng;
+    }
     ctx->security.encryption_type = 2; /* ML-KEM-768 */
     ctx->security.kem_ct_size = PQCLEAN_MLKEM768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
 
@@ -349,7 +401,10 @@ int qtsq_vault_encrypt_pq(qtsq_context_t *ctx, const uint8_t recipient_pk[1184])
 
 int qtsq_vault_decrypt_pq(qtsq_context_t *ctx, const uint8_t my_sk[2400]) {
     if (!ctx || !my_sk) return QTSQ_ERR_NULL;
-    if (!ctx->is_encrypted) return QTSQ_OK;
+    if (!ctx->is_encrypted) {
+        if (security_block_indicates_encryption(ctx)) return QTSQ_ERR_DECRYPT;
+        return QTSQ_OK;
+    }
     
     /* Phase 2b: handle both PQ-only (type=2) and layered (type=3) */
     if (ctx->security.encryption_type != 2 && ctx->security.encryption_type != 3) {

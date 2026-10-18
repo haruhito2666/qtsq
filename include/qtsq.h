@@ -594,6 +594,11 @@ int qtsq_decompress_accretion(const qtsq_context_t *ctx,
                               uint8_t **out_data, size_t *out_size);
 
 /* ══════ Container (Multi-Data) ══════ */
+/* Free and detach an unpacked container builder from the context (M-14).
+ * Called automatically by qtsq_free(); exposed so callers' error paths can
+ * do the same. Safe no-op when no builder is attached. */
+void qtsq_container_abandon(qtsq_context_t *ctx);
+
 int qtsq_container_create(qtsq_context_t *ctx);
 int qtsq_container_add_file(qtsq_context_t *ctx, const char *path,
                              const char *stream_name);

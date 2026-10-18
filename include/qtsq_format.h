@@ -173,6 +173,8 @@ typedef enum {
 #define QTSQ_ERR_NOT_ENCRYPTED  -15  /* Phase 1: qtsq_write refuses plaintext (.qtsq must be encrypted) */
 #define QTSQ_ERR_NOT_SANITIZED  -16  /* Phase 1: qtsq_write refuses unsanitized context */
 #define QTSQ_ERR_TOO_LARGE      -17  /* SEC: input or file-declared size exceeds safety cap */
+#define QTSQ_ERR_KEYSTORE       -18  /* SEC (H-11): hardware keystore unavailable */
+#define QTSQ_ERR_RANDOM         -19  /* SEC (M-5): CSPRNG failed; refusing to continue */  /* SEC (H-11): hardware keystore unavailable; refusing to write private keys in plaintext */
 
 /* file header v2 — 96 bytes packed
  * v1 was 80 bytes with uint32_t sizes (4 GB limit)

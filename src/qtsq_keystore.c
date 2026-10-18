@@ -48,12 +48,11 @@ static int keystore_mkpath(const char *dirpath) {
   #define QTSQ_PLATFORM_ANDROID 1
   #include <sys/stat.h>
   #include <unistd.h>
-  /* Phase 2d: Android Keystore requires JNI to access KeyStore API.
-   * For now, we use file-based storage with a clear TODO marker.
-   * Full implementation would need:
-   * - JNI bridge to android.security.keystore.KeyStore
-   * - Java helper to generate/retrieve keys
-   * - Encryption of the key file with a Keystore-derived key */
+  /* Phase 2d: Android Keystore is reached through the JNI bridge below.
+   * The bridge wraps the key material with an AndroidKeyStore key; the
+   * file on disk is always ciphertext. H-11: when the bridge is absent or
+   * fails, storage is REFUSED (QTSQ_ERR_KEYSTORE) instead of silently
+   * writing ML-KEM/ML-DSA private keys in plaintext. */
 #elif defined(__linux__)
   #define QTSQ_PLATFORM_LINUX 1
   #include <sys/stat.h>
@@ -362,7 +361,8 @@ static int ensure_keystore_dir_android(void) {
 
 /* Key-file format byte (Android backend):
  *   0x01 = body is AndroidKeyStore-wrapped ciphertext (via JNI bridge)
- *   0x00 = body is plaintext (bridge unavailable or failed — loud warning) */
+ *   0x00 = legacy plaintext body (H-11 era and earlier). Still READ for
+ *          migration; never written again. */
 #define QTSQ_KF_PLAIN 0x00
 #define QTSQ_KF_ENC   0x01
 
@@ -387,36 +387,35 @@ static int keystore_store_android(const char *key_id,
     get_keystore_dir_android(dir, sizeof(dir));
     snprintf(path, sizeof(path), "%s/%s.bin", dir, key_id);
 
-    /* Phase 2d: encrypt with the AndroidKeyStore JNI bridge when available.
-     * If the bridge itself fails (OEM KeyStore quirks, invalidated key, …),
-     * DO NOT fail the whole init — that made every save on the device
-     * impossible forever. Fall back to plaintext storage (chmod 600,
-     * app-private dir) with a loud warning, matching the documented
-     * no-bridge behavior. The real exception is logged under QTSQ_KSJNI. */
-    uint8_t out[8192 + 1];
-    if (g_jni_encrypt) {
-        if (len > sizeof(out) - 1) return QTSQ_ERR_ALLOC;
-        size_t ct_len = 0;
-        int brc = g_jni_encrypt(data, len, out + 1, sizeof(out) - 1, &ct_len);
-        if (brc == 0 && ct_len <= sizeof(out) - 1) {
-            out[0] = QTSQ_KF_ENC;
-            return keystore_write_file_android(path, out, ct_len + 1);
-        }
+    /* Phase 2d / H-11: encrypt with the AndroidKeyStore JNI bridge. A
+     * missing or failing bridge is a hard error now. The old fallback
+     * wrote the ML-KEM-768 and ML-DSA-65 private keys as plaintext into
+     * ~/.qtsq/keys/ with chmod 600 — on a rooted device, an ADB backup,
+     * or any file-exfil path that is the entire device identity. A failed
+     * save is recoverable (register the bridge, or restore from Shamir
+     * shares); a leaked identity key is not. */
+    if (!g_jni_encrypt) {
         fprintf(stderr,
-            "[QTSQ] ⚠️  keystore: bridge encrypt FAILED (rc=%d) for %s — "
-            "storing PLAINTEXT in app-private dir. Check logcat tag QTSQ_KSJNI "
-            "for the underlying Java exception.\n", brc, key_id);
-        /* fall through to plaintext */
-    } else {
-        fprintf(stderr,
-            "[QTSQ] ⚠️  keystore: storing %s in PLAINTEXT at %s (no JNI bridge "
-            "registered).\n", key_id, path);
+            "[QTSQ] keystore: no JNI bridge registered — refusing to store "
+            "%s in plaintext (H-11). Call qtsq_keystore_set_jni_bridge() at "
+            "app startup.\n", key_id);
+        return QTSQ_ERR_KEYSTORE;
     }
 
+    uint8_t out[8192 + 1];
     if (len > sizeof(out) - 1) return QTSQ_ERR_ALLOC;
-    out[0] = QTSQ_KF_PLAIN;
-    memcpy(out + 1, data, len);
-    return keystore_write_file_android(path, out, len + 1);
+    size_t ct_len = 0;
+    int brc = g_jni_encrypt(data, len, out + 1, sizeof(out) - 1, &ct_len);
+    if (brc == 0 && ct_len <= sizeof(out) - 1) {
+        out[0] = QTSQ_KF_ENC;
+        return keystore_write_file_android(path, out, ct_len + 1);
+    }
+
+    fprintf(stderr,
+        "[QTSQ] keystore: bridge encrypt FAILED (rc=%d) for %s — refusing "
+        "plaintext fallback (H-11). Check logcat tag QTSQ_KSJNI for the "
+        "underlying Java exception.\n", brc, key_id);
+    return QTSQ_ERR_KEYSTORE;
 }
 
 static int keystore_load_android(const char *key_id,
@@ -471,9 +470,9 @@ static int keystore_load_android(const char *key_id,
         } while (0);
         break;
 
-    case QTSQ_KF_PLAIN:
+    case QTSQ_KF_PLAIN:     /* legacy plaintext body — read for migration only */
     default:
-        /* Plaintext body (or legacy unprefixed file — caller's expected-size
+        /* Legacy plaintext body (or unprefixed file — caller's expected-size
          * check rejects garbage, which then triggers self-heal). */
         if (body_len > cap) { rc = QTSQ_ERR_ALLOC; break; }
         memcpy(data, body, body_len);

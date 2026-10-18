@@ -244,7 +244,12 @@ int qtsq_c2pa_parse_manifest(const uint8_t *manifest, size_t size,
     while (sub.n > 0) {
         char t2[4]; const uint8_t *p2; size_t l2;
         if (rd_box(&sub, t2, &p2, &l2) != QTSQ_OK) return QTSQ_ERR_FORMAT;
-        if (memcmp(t2, "cbor", 4) == 0) { claim = p2; claim_len = l2; }
+        if (memcmp(t2, "cbor", 4) == 0) {
+            /* M-10: exactly one claim box; a duplicate would let a parser
+             * and a verifier disagree about which claim was signed. */
+            if (claim) return QTSQ_ERR_FORMAT;
+            claim = p2; claim_len = l2;
+        }
     }
     if (!claim) return QTSQ_ERR_FORMAT;
 
@@ -321,10 +326,18 @@ int qtsq_c2pa_verify_manifest(const uint8_t *manifest, size_t size,
     while (sub.n > 0) {
         char t2[4]; const uint8_t *p2; size_t l2;
         if (rd_box(&sub, t2, &p2, &l2) != QTSQ_OK) return QTSQ_ERR_FORMAT;
-        if (memcmp(t2, "cbor", 4) == 0) { claim = p2; claim_len = l2; }
+        if (memcmp(t2, "cbor", 4) == 0) {
+            /* M-10: reject duplicate claim/signature boxes -- "the last
+             * one wins" let an appended pair rebind which claim gets
+             * rendered vs. which digest the signature was checked over. */
+            if (claim) return QTSQ_ERR_FORMAT;
+            claim = p2; claim_len = l2;
+        }
         else if (memcmp(t2, "qtsi", 4) == 0) {
+            if (sig) return QTSQ_ERR_FORMAT;
             if (l2 < 4) return QTSQ_ERR_FORMAT;
             uint32_t sl = ((uint32_t)p2[0]<<24)|((uint32_t)p2[1]<<16)|((uint32_t)p2[2]<<8)|p2[3];
+            if ((size_t)sl != PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES) return QTSQ_ERR_FORMAT;
             if (4 + sl <= l2) { sig = p2 + 4; sig_len = sl; }
         }
     }

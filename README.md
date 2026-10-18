@@ -468,15 +468,17 @@ thirteen defects that are now fixed — most seriously, per-stream encryption wa
 writing the raw AES-CTR keystream over the plaintext instead of encrypting, so
 it destroyed the data it was applied to. That path had no test; it does now.
 
-Thirteen **high** and fourteen **medium** findings remain open, and roughly
-25,000 lines (`compressor/src/*.c` and the engine files) have not been audited
-at all. Known-unfixed items include fail-open decryption when a header flag is
-cleared, AES-CTR nonce reuse on re-encrypt, a plaintext private-key fallback in
-the Android keystore, and Shamir shares stored unencrypted inside the envelope
-they protect.
+That remediation pass has since been completed for every finding in the audit's
+container, crypto and binding scope, with regression tests for the vault,
+censorship-KDF and Shamir paths. Two items are documented rather than fixed:
+stream-name obfuscation XORs on a salt written in cleartext and is **not a
+cipher** (see `docs/FORMAT.md` §8), and region-crypt output is unauthenticated
+by design unless it is wrapped in an authenticated layer such as the vault
+envelope. Roughly 25,000 lines (`compressor/src/*.c` and the engine files)
+still have not been audited at all.
 
-Treat any file produced by this library as **untrusted input** until that work
-lands. Do not rely on it to protect data you cannot afford to lose.
+Treat any file produced by this library as **untrusted input**. Do not rely on
+it to protect data you cannot afford to lose.
 
 ## Install
 

@@ -9,7 +9,18 @@
 #include "qtsq_turbo.h"
 #include "qtsq_sanitize.h"
 #include "../crypto/common/aes.h"
+
+/* M-6: aes256_ctx_release() free()s the expanded key schedule WITHOUT
+ * wiping it, and zeroing the context struct afterwards only clears a
+ * dangling pointer. Wipe the schedule first, then release. */
+static void aes256_release_wipe(aes256ctx *r) {
+    if (r->sk_exp)
+        qtsq_secure_zero(r->sk_exp, sizeof(uint64_t) * PQC_AES256_STATESIZE);
+    aes256_ctx_release(r);
+    qtsq_secure_zero(r, sizeof(*r));
+}
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 #include "../crypto/common/fips202.h"
 #include "../crypto/argon2/argon2.h"
 #include <stdlib.h>
@@ -327,7 +338,7 @@ int qtsq_turbo_encrypt_block(uint8_t *data, size_t size,
 
     /* PQClean aes256_ctr emits the keystream; XOR it with the data in-place. */
     uint8_t *keystream = (uint8_t *)malloc(size);
-    if (!keystream) { aes256_ctx_release(&aes); return QTSQ_ERR_ALLOC; }
+    if (!keystream) { aes256_release_wipe(&aes); return QTSQ_ERR_ALLOC; }
     aes256_ctr(keystream, size, iv_block, &aes);
     for (size_t i = 0; i < size; i++) {
         data[i] ^= keystream[i];
@@ -335,8 +346,7 @@ int qtsq_turbo_encrypt_block(uint8_t *data, size_t size,
 
     qtsq_secure_zero(keystream, size);
     free(keystream);
-    aes256_ctx_release(&aes);
-    qtsq_secure_zero(&aes, sizeof(aes));
+    aes256_release_wipe(&aes);
     qtsq_secure_zero(iv_block, sizeof(iv_block));
     return QTSQ_OK;
 }
@@ -508,8 +518,12 @@ int qtsq_turbo_write(const qtsq_context_t *ctx, const char *filename,
          * Generate a fresh random IV per file and persist it in the header
          * reserved32 field alongside the turbo magic. */
         uint8_t salt[32];
-        randombytes(salt, 32);
-        randombytes(iv, 12);
+        if (qtsq_random_bytes(salt, 32) != 0 ||
+            qtsq_random_bytes(iv, 12) != 0) {
+            for (uint32_t i = 0; i < num_blocks; i++) free(jobs[i].output);
+            free(jobs);
+            return QTSQ_ERR_RANDOM;
+        }
         memset(iv + 12, 0, 4);
 
         int ar = argon2id_hash_raw(

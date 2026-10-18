@@ -317,6 +317,10 @@ int qtsq_set_original_input(qtsq_context_t *ctx,
 
 void qtsq_free(qtsq_context_t *ctx) {
     if (!ctx) return;
+    /* M-14: an unpacked container holds a builder behind the tagged
+     * pointer in ctx->singularity; free it properly before the generic
+     * frees below, or the builder and every slot leak. */
+    qtsq_container_abandon(ctx);
     /* Securely zero sensitive buffers before freeing */
     if (ctx->singularity && ctx->singularity_size > 0)
         qtsq_secure_zero(ctx->singularity, (size_t)ctx->singularity_size);
@@ -451,6 +455,7 @@ void qtsq_print_info(const qtsq_context_t *ctx) {
  * ══════════════════════════════════════════════════════════════ */
 
 #include "../crypto/common/randombytes.h"
+#include "qtsq_rng.h"
 
 /* Magic marking the size-padding trailer. Sits inside the encryption
  * envelope so it is only visible after decrypt; it lets qtsq_unpad_size
@@ -505,7 +510,11 @@ int qtsq_pad_size(qtsq_context_t *ctx) {
     uint8_t *new_buf = (uint8_t *)realloc(ctx->singularity, (size_t)target);
     if (!new_buf) return QTSQ_ERR_ALLOC;
 
-    randombytes(new_buf + current, pad_bytes);
+    if (qtsq_random_bytes(new_buf + current, pad_bytes) != 0) {
+        /* realloc already replaced the old block; keep that consistent. */
+        ctx->singularity = new_buf;
+        return QTSQ_ERR_RANDOM;
+    }
 
     ctx->singularity = new_buf;
     ctx->singularity_size = (size_t)target;
