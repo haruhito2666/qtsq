@@ -27,7 +27,7 @@ dist/
 *.o.dSYM/
 qtsq.egg-info/
 
-# Generated macOS app bundles (the .xcodeproj files are tracked; these are not)
+# Generated macOS app bundles (the .xcodeproj files are local-only; these are not)
 *.app/
 build.log
 
@@ -85,5 +85,14 @@ src/test-images/
 # Stray patch file at repo root
 /patch.diff
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # Xcode derived data for the macOS apps
 build/
+
+# Local-only source trees removed from the public repository
+demos/
+PhotonStudio.xcodeproj/
+QTSQStudio.xcodeproj/

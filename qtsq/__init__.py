@@ -44,7 +44,7 @@ Usage:
     graph = data.to_graph()
 
 Author: haruhito
-License: Proprietary
+License: Apache-2.0
 """
 
 import os

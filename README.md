@@ -544,4 +544,4 @@ make cli    # → bin/qtsq (command-line tool)
 
 ## License
 
-Proprietary — © haruhito
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

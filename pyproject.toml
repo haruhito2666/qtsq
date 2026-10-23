@@ -8,7 +8,7 @@ version = "2.2.0"
 description = "Read, write, compress, and decompress .qtsq files — images, text, tensors, and AI brain states."
 readme = "README.md"
 authors = [{name = "haruhito"}]
-license = "LicenseRef-Proprietary"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.8"
 dependencies = [
     "numpy>=1.20.0",
@@ -16,6 +16,7 @@ dependencies = [
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: Apache Software License",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Multimedia :: Graphics",

@@ -1,0 +1,19 @@
+QTSQ — Quantum Tensor Sequence
+Copyright 2026 Haruhito
+
+This product includes software developed by Haruhito.
+
+Third-party components:
+
+- ML-KEM-768 and ML-DSA-65 implementations (crypto/ml-kem-768,
+  crypto/ml-dsa-65): public domain (CC0 1.0 Universal).
+
+- Argon2 reference implementation (crypto/argon2): CC0 1.0 Universal or
+  Apache License 2.0, at your option.
+
+- stb_image and stb_image_write (include/stb_image.h,
+  include/stb_image_write.h): MIT License or public domain, at your
+  option. The full license text is retained in each header.
+
+The Apache License 2.0 terms that apply to this project are in the
+LICENSE file.
