@@ -73,7 +73,9 @@ Three items are honestly partial, and the deltas are listed under "Deviations" b
 - [x] W5.3 Decay policy `none | exponential | ttl`, decoupled from the mode
 - [x] W5.4 Pinned strength floor (pins never drop below 0.2)
 - [x] W5.5 `consolidate()` labels output `representative`, never "summary"
-- [x] W5.6 Arbitrary dimensions 64–4096
+- [x] ~~W5.6 Arbitrary dimensions 64–4096~~ — **not a plan item.** The plan's W5 stops at
+      W5.5; "any dim accepted" is the Phase-2 exit gate, counted as an item here by mistake.
+      The module bounds dimensions on purpose — corrected in the 2026-10-30 honesty pass.
 
 ### W6 — API honesty & ergonomics (Phase 0 bugs / Phase 2 surface)
 - [x] W6.1 `flush()` returns `{ok, records_written, ...}` and errors are returned, never swallowed
@@ -443,9 +445,12 @@ alone so old builds read the same bytes.
 
 ### 2026-10-30 — plan audit: every item re-checked against code, eight gaps closed
 
-The upgrade was declared finished; this pass re-audited all 43 plan items (W1.1–W7.6)
-against the shipped source with four independent adversarial readers, then fixed what
-they found. The audit's value was in what it refused to accept: comments that claimed
+The upgrade was declared finished; this pass re-audited all **41** plan items (W1.1–W1.8,
+W2.1–W2.5, W3.1–W3.6, W4.1–W4.6, W5.1–W5.5, W6.1–W6.5, W7.1–W7.6) against the shipped
+source with four independent adversarial readers, then fixed what they found. (This entry
+first said 43; the plan has 41 and there is no W5.6 — "any dim accepted" is a Phase-2 exit
+gate, `QTSQ_UPGRADE_PLAN.md:205`, not an item. See the honesty pass at the end of this
+entry.) The audit's value was in what it refused to accept: comments that claimed
 behaviour, tests that could not fail, and guarantees that only held on the happy path.
 
 **Gaps that were real defects, now fixed (C module):**
@@ -543,16 +548,161 @@ agreed with itself; it now asserts literal 256/4).
 
 **Still open, recorded so it is not mistaken for done:**
 - W1.5's *name-reuse* half is implemented (`next_seq` stats the disk and skips existing
-  `seg-<gen>-<seq>` names) but has no test that makes a publish collide with a planted
-  file. Monotonic generation is tested.
+  `seg-<gen>-<seq>` names) but had no test that makes a publish collide with a planted
+  file; **tested in the honesty pass below** (`tests/test_w1_names.c`, 24 checks, and it
+  is mutation-tested). Monotonic generation was already tested.
 - W3.5 record-level isolation is unreachable on an encrypted store: the GCM tag check
   rejects the segment before any per-record CRC is consulted, so damage degrades to
-  segment-level there. By construction, documented in `test_w3_storage.c`.
-- W5.6: the phase-2 gate says "any dim accepted"; the module deliberately accepts
+  segment-level there. By construction, documented in `test_w3_storage.c` and now in the
+  README guarantees table as well (honesty pass below).
+- No W5.6 item: the phase-2 gate says "any dim accepted"; the module deliberately accepts
   64..4096 and rejects outside it, pinned by `test_dims.c`. The gate wording should say
-  what the code means.
-- HNSW's f32 copy caps the whole-brain heap win at ~1.63x; int8 dedup is exact-only;
-  `sfb serve` serves one client at a time and is Darwin-tested only.
+  what the code means. (`test_dims.c:121` still labels the bounds "W5.6"; the test files
+  were not in scope for this pass.)
+- HNSW's f32 copy caps the whole-brain heap win at ~1.63x; int8's exact-dedup leg is
+  exact-only; `sfb serve` serves one client at a time and is Darwin-tested only.
+
+**Honesty pass (later the same day) — W1.5's missing test, and four deviations written
+where a reader will find them.**
+
+*W1.5 name reuse now has the test it never had.* `tests/test_w1_names.c` (24 checks, added
+to the Makefile's `TESTS`) reads the sealed segment's name off the disk instead of
+predicting it, derives from that name the name the next publish would naturally choose
+(same `brain.qtsq.d/`, the generation the publish bumps to, seq 1), plants 512 bytes of
+junk there **and at seq 2 and 3 above it**, then publishes 40 more rows. It asserts
+(a) the publish succeeded (`SFB_OK`, `ok=1`, one segment sealed, 40 records written),
+(b) exactly one new segment file appeared and it is `seg-<gen>-000004` — none of the three
+planted names, (c) all three plants are still present and byte-identical and no manifest
+`(gen,seq)` entry matches one, (d) after a reopen all 85 rows are live with
+`records_dropped=0`, `segments_quarantined=0`, and every phase's text is in `sfb_list`.
+A second publish plants seq 1 *and the highest seq this store has ever used (9)* and gets
+seq 2: the skip fills the hole below a plant rather than leaping over it, and never reuses
+the high name. The plants are orphans by design, so a later reclaim sweep may collect
+them — every plant check runs before the close, which is the moment the guarantee is about.
+
+*Mutation-checked.* In a throwaway copy of the module under `/tmp` (deleted afterwards;
+the repo's `sfb_store.c` was never edited), the whole probe loop in `next_seq()` —
+**`sfb_store.c:842-851`**, the loop whose `return cand` at `:850` hands out the first free
+name — was replaced with the unprobed value:
+
+```c
+    /* MUTATION (throwaway copy): return the unprobed value. */
+    (void)path; (void)st;
+    return max + 1u;
+```
+
+The suite then fails **7 of 24** checks, including:
+
+```
+[FAIL] (b) exactly one new segment file appeared (the publish wrote once) — 4 file(s)
+       before the publish (1 segment + 3 plants), 4 after, 0 new (none)
+[FAIL] (c) every planted file still holds its planted bytes — 3/3 planted files
+       present, 2/3 byte-identical
+[FAIL] (c) the manifest does not claim a planted name as its own — 2 manifest entries,
+       1 of them on a planted (gen,seq)
+```
+
+and the planted `seg-000002-000001.qtsq` — 512 bytes beginning `PLANTED-JUNK` — is
+23 572 bytes beginning `32 53 46 53` (`SFB_MAGIC_SEGMENT`) afterwards: the publish renamed
+a real segment over another file's name. Restored, 24/24 pass. **The guarantee is real,
+and it is now pinned.**
+
+*The four deviations, now in the README rather than only in passing:*
+
+1. **Dimensions.** The Phase-2 exit gate says "any dim accepted"
+   (`QTSQ_UPGRADE_PLAN.md:205`). The module accepts **64..4096** and refuses anything
+   outside with `SFB_E_DIM` at open (`sfb_brain.c:1683`, `sfb_store.c:680-682`), pinned by
+   `test_dims.c` (63 and 4097 refused; 64 and 4096 accepted). The bound exists because
+   `dim` is part of every fixed-size record — the on-disk segment record
+   (`44 + tl + rl + dim` bytes), the HNSW link rows and the index records are all sized
+   from it. A range the format can describe is what makes "we never read or write out of
+   bounds" provable; an arbitrary `dim` would be a silently reinterpreted buffer, not a
+   bigger record.
+2. **INT8.** The plan promises "per-segment scale factors (4× footprint reduction)"
+   (`QTSQ_UPGRADE_PLAN.md:165`). The shipped module uses **one f32 scale per record**, not
+   per segment — a segment mixes unrelated memories, and one scale would clip the loud
+   rows or flatten the quiet ones (`sfb_quant.c:104-121`) — and the measured whole-store
+   reduction is **3.36x**, not 4x: f32 4 348 310 B vs int8 1 292 310 B on the same
+   4000×256 corpus, 3.02x when sealed, 3.37x on the payload, 3.94x on the vector store's
+   own bytes per row. Only the vector bytes shrink (4·dim → dim + 4 per row); the HNSW
+   graph, the record headers and the manifest do not, and that is where the missing 0.64x
+   lives. In int8 mode the exact-dedup leg is also **exact-only**: the query is quantised
+   with the same rule and its `(scale, codes)` pair must match the stored row, so
+   re-remembering the same memory still folds while a merely nearby vector no longer
+   folds on that leg (only the HNSW-neighbour + Jaccard leg can).
+3. **Item count.** The plan has **41** items (W1.1–W1.8, W2.1–W2.5, W3.1–W3.6,
+   W4.1–W4.6, W5.1–W5.5, W6.1–W6.5, W7.1–W7.6), not 43. There is no **W5.6**: the task
+   board's "W5.6 Arbitrary dimensions 64–4096" line and the "(W5.6)" label at
+   `test_dims.c:121` are both the Phase-2 exit gate "any dim accepted", counted as an item
+   by mistake. The board line is struck through above; the test file was not in scope for
+   this pass.
+4. **Encrypted stores.** Record-level CRC isolation is unreachable on a sealed store:
+   AES-256-GCM authenticates the payload as a unit, so the GCM tag rejects the segment
+   before any per-record CRC is consulted and damage degrades to segment level. By
+   construction, documented in `test_w3_storage.c` — and now in the README guarantees
+   table (a row of its own plus a pointer from the "one bit-flip" row), because it changes
+   what "one bit-flip costs one record" means for anyone running encrypted.
+
+*Verification after this pass:* `make test` → **18 C suites + `serve`, 0 failures**. The
+17 suites that print a count sum to **13,628** checks (the 24 new ones included);
+`test_text_quant` prints none. The README's earlier "13,637 across 16 suites" line was
+already stale — before this pass the same tree printed 13,604 from its 16 counting suites,
+and the `TESTS` list held 17 entries, not 16 — so the table now reports what `make test`
+actually prints.
+
+### 2026-10-30 — Upgrade plan finished on the Rust surface; the gates measured (and two of three fail)
+
+The remaining 15 half-done items of `QTSQ_UPGRADE_PLAN.md` were closed in the runtime
+(`~/ai-native-js-runtime`), which owns `sofuu.memory`. The C module in this tree was not
+the target of this pass — it is an island no runtime code references — so the entries
+below are Rust-side, and say so.
+
+**Closed this pass**
+
+| Item | What landed | Evidence |
+|---|---|---|
+| W2.1 locking | `rt/brain_lock.rs`: `flock` on `<brain>.lock`, exclusive for writers, shared for readers, an in-process refcount registry, and a degraded (reported, never silently unlocked) path when the filesystem cannot lock | `memory::` 141 pass; rival open-file-description is refused |
+| W2.2 readonly | `open(path, dim, {readonly})` — no repair, no backup, no re-encryption, no stale-`.tmp` sweep; every mutating entry point refuses with `E_LOCKED` instead of buffering a write it can never flush | bytes and mtime identical across a readonly session (`sha256` before/after) |
+| W2.3 reader-deferred repair | a readonly/reader open leaves damage in place and reports it; the repair happens on a writable open | `impl_qtsq` damage suites |
+| W3.3 lazy open | open reads the MANIFEST only; the first row access materialises. `loadState()` reports `{loaded, pending, segments_read}` **without** triggering the load (`stats()` is itself an access, so it cannot) | at 300 records / 2 segments: `open → loaded=false pending=true segments_read=0`; after `count() → segments_read=2`; `verifyFull` → 2 at open |
+| W3.4 reclaim trigger | flush now reclaims superseded generations, immediately and by reference (`keep` = manifest epoch + every listed segment generation). Safe without an age guard because the writer holds `LOCK_EX`, which excludes readers too | `w3_4_repeated_flushes_do_not_accumulate_store_generations` |
+| W3.5 per-record CRC | per-record verification is behind `SOFUU_CMA_PER_RECORD_VERIFY`, with a mutation-proof test showing the flip SURVIVES when it is off | `w3_5_mutation_proof_*` |
+| W3.1 graph snapshot | `Hnsw::save_to` / `load_with_vectors`, `graph-<epoch>.bin`, corruption → rebuild | 4 × `w3_1_*` |
+| W5.3 decay policy | `set_decay_params/decay_params` (NONE/EXPONENTIAL/TTL), **persisted in the manifest** and inherited by a silent reopen — the bug the item exists for is a brain that stops forgetting on schedule after a restart | `w5_3_a_flushed_decay_policy_is_inherited_by_a_silent_reopen` |
+| W5.4 pin floor | a live pin is held at `PIN_FLOOR` (0.2) instead of sinking below the forget floor | `decay_eval_pin_survives_a_month_and_stays_recallable` |
+| W1.5 / W5.5 / docs | C-side name-reuse test (24 checks, mutation-proven), 41-item count, dims 64..4096, INT8 amplification, encrypted-store segment-level isolation | see the entry above |
+
+**Measured, not claimed** (`cargo run --release -p sofuu-core --example brain_gates`,
+100 000 records, dim 64, 200 flushes of 256 — 663 s wall):
+
+* **lazy open: 27.4 ms.** The gate's 1.000 s is met *for the open call*, which is what
+  W3.3 was for.
+* **usable access: 170.04 s.** The harness deliberately gates on open + count +
+  first query, because that is the number that is true for a lazy *and* an eager open.
+  Materialising 391 segments costs ~435 ms each; the initial flush that wrote them cost
+  43.2 s. **The Phase 1 gate is NOT met** and the harness says so.
+* **flush P99: 302.0 ms** against a 50 ms limit (p50 253.9 ms). **NOT met.**
+* **10 000 distinct texts → 10 000 records: PASS** (0 collapsed).
+
+So: 2 of 3 gates fail, on numbers nobody had ever taken. The per-segment codec
+(~110 ms to write and ~435 ms to read 74 KB) is the suspect, and the O(n²)-looking
+ingest (168.5 s for 100k = 1.7 ms/record) is the second. Both are recorded here rather
+than smoothed over; the CI step that measures them is `continue-on-error` with the
+numbers written into the comment, so it cannot paint every PR red for a defect it
+already names.
+
+**One honest reversal:** `open()` used to refuse a second handle on the same brain
+*in the same process*, because `flock` arbitrates open file descriptions. That broke
+every reopen-after-close in the JS suites (4 suites, 3 of them for this reason alone),
+and it is the wrong semantics anyway — the corruption W2.1 exists to stop is two
+PROCESSES. Handles in one process now share one refcounted kernel lock, and the test
+that used to assert same-process refusal now proves a *rival open file description* is
+still refused.
+
+*Verification after this pass:* Rust `cargo test -p sofuu-core --lib memory::` →
+**141 passed, 0 failed, 2 ignored** (was 123); JS `bash tests/run_js_tests.sh` →
+**68 passed, 0 failed, 1 skipped**; C `make test` → **18 suites + serve, 0 failures**.
+
 
 ### Template for new entries
 

@@ -32,7 +32,7 @@ make chaos      # SIGKILL / corruption / stampede / ENOSPC matrix
 ```c
 sfb_config_t cfg; sfb_config_default(&cfg, "/var/lib/app/brain", 768);
 cfg.mode = SFB_MODE_COGNITIVE;   /* or SFB_MODE_VECTOR_DB */
-cfg.dimensions 64..4096;
+cfg.dim = 768;                   /* 64..4096 only; anything else is SFB_E_DIM */
 cfg.decay = SFB_DECAY_EXPONENTIAL | SFB_DECAY_NONE | SFB_DECAY_TTL;
 cfg.dedup_text_similarity = 0.85;  cfg.dedup_action = SFB_DEDUP_MERGE;
 cfg.read_only = 0;  cfg.key = "optional passphrase";  cfg.capacity = 100000;
@@ -58,7 +58,8 @@ sfb_close(b);
 | Guarantee | Mechanism |
 |---|---|
 | A damaged manifest never becomes an empty brain | CRC32C over header + segment table; `SFB_E_CORRUPT` instead of silent zero (W1.4) |
-| One bit-flip costs one record, not 256 | per-record CRC32C over the WHOLE record (vector included) behind segment flag bit3; replay drops only the damaged row (W3.5). A truncated segment still falls as a unit — a half-written segment is not a record-level fault |
+| One bit-flip costs one record, not 256 | per-record CRC32C over the WHOLE record (vector included) behind segment flag bit3; replay drops only the damaged row (W3.5). A truncated segment still falls as a unit — a half-written segment is not a record-level fault. A **sealed** store cannot reach this path with a bit-flip at all — see the next row |
+| …but on an encrypted store it costs one segment, not one record | AES-256-GCM authenticates the sealed payload as a unit, so the GCM tag rejects a damaged segment before any per-record CRC is consulted. Record-level isolation is unreachable there **by construction**, not by oversight (W3.5) |
 | A read-only open writes nothing | readers take `O_RDONLY` + `flock(LOCK_SH)`, or a shared flock on the store directory when no lock file exists; no file is created, truncated or recorded (W2.3) |
 | Opening a brain does not replay it | `sfb_open` reads the manifest and probes the newest segment header; payloads load on first row access. `verify_full` is the paranoid path (W3.3) |
 | A pinned row never drops below 0.2 | the floor is an invariant, not a `pins_immune` knob (W5.4) |
@@ -71,6 +72,7 @@ sfb_close(b);
 | Recall does not collapse with size | diversity-aware neighbour selection + bidirectional repair (W4.1–4.2) |
 | Open does not rebuild the graph | `sfb_hnsw_map()` maps the topology file and points the arrays at it (W3.1) |
 | Memory stays proportional to *used* levels | pooled link rows, 1.07 rows/node instead of 33 |
+| Dimensions are bounded, not arbitrary | `cfg.dim` must be **64..4096**; anything outside is `SFB_E_DIM` at open. `dim` is baked into every fixed-size on-disk and index record (the segment record, the HNSW link rows, the manifest), so the bound is what makes the layout provably in bounds instead of a silent reinterpretation of a caller's buffer. The plan's Phase-2 exit gate says "any dim accepted" — this is a deliberate narrowing, pinned by `test_dims.c` (63 and 4097 refused, 64 and 4096 accepted) |
 | Non-finite vectors cannot crash the process | rejected at ingest (`SFB_E_NONFINITE`) and total-order-safe distances (W1.1–1.2) |
 | Distinct memories are not swallowed | dual-key dedup: vector L2 **and** token Jaccard (W5.1) |
 | Decay demotes instead of stranding | below-floor strength ⇒ `SFB_TIER_FORGOTTEN` (W5.3) |
@@ -92,9 +94,9 @@ sfb_close(b);
 | manifest fuzz | 0/20 silent empty opens | 0 |
 | AES-256-GCM | 4 NIST vectors, cross-checked against OpenSSL | vectors pass |
 | INT8 quantisation error | 0.445 % max, 0.286 % RMS | <= 1.5 % |
-| INT8 footprint (persisted) | **3.36x smaller** whole store (3.02x sealed) | 4x payload |
+| INT8 footprint (persisted) | **3.36x smaller** whole store, 3.02x sealed, 3.37x on the payload (f32 4 348 310 B vs int8 1 292 310 B) — not 4x: only the vector bytes shrink | 4x payload |
 | exact dimension enforcement | wrong-length write/query -> `SFB_E_DIM`, no OOB read | refused |
-| unit checks | **13,637 across 16 suites** + 27 socket checks + 7 chaos cases | all pass |
+| unit checks | **13,628 across 18 C suites** + 27 socket checks + 7 chaos cases (the sum covers the 17 suites that print a count; `test_text_quant` prints none) | all pass |
 
 Known cost: ingest is **13.8 ms/record at dim 768** (3.7 ms at dim 384), dominated by the
 diversity heuristic at `efConstruction=200`. Correctness is not in question (100 % recall
@@ -108,10 +110,18 @@ load throughput matters more than build-time recall margin.
 - The plain `sfb_remember()`/`sfb_recall()` cannot see a caller's buffer length. They
   are now thin shims over `sfb_remember_ex()`/`sfb_recall_ex()`, which do enforce it;
   a caller that knows its length should use the `_ex` entry points.
-- INT8 stores int8 codes plus a per-segment scale table. It is a footprint/write
+- INT8 stores int8 codes plus **one f32 scale per record**, not one per segment as the
+  plan specifies: a segment mixes unrelated memories, and a single scale would clip the
+  loud rows or flatten the quiet ones (`sfb_quant.c:104-121`). The measured whole-store
+  reduction is **3.36x**, not the promised 4x, because only the vector bytes shrink
+  (4·dim → dim + 4 per row) while the HNSW graph, record headers and manifest do not —
+  3.94x is what the vector store's own bytes per row reach. It is a footprint/write
   optimisation, not a recall gain: quantised vectors are dequantised for the graph,
   so search quality is unchanged but a quantised brain is not bit-identical to a
-  float32 one at large scale.
+  float32 one at large scale. Dedup narrows too: in int8 mode the exact-vector leg is
+  **exact-only** — the query's `(scale, codes)` pair must match the stored row — so
+  re-remembering the same memory still folds, while a merely nearby vector no longer
+  folds there (only the HNSW-neighbour + Jaccard leg can).
 - `sfb serve` handles one client at a time and was exercised only on Darwin;
   `flock` semantics over NFS/SMB and power-loss (as opposed to process-crash)
   durability are still untested.
