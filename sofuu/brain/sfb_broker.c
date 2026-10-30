@@ -18,6 +18,16 @@
  *   SFB_OP_STATS     (5)  payload: -                      resp: json text
  *   SFB_OP_FORGET    (6)  payload: u32 id                 resp: -
  *
+ * Payload validation (W2.4). Whatever op the client sends, the server never
+ * reads a byte the client did not send: each buffer op declares its fields in a
+ * fixed order, so the payload length must be *exactly* the stated size
+ * (dim floats and no more, one query vector and no more), every field access is
+ * bounds-checked against the declared length, and a payload with the wrong
+ * number of floats is handed to the length-checking sfb_*_ex() entry point so
+ * it fails with SFB_E_DIM instead of being read past its end. A frame that is
+ * short, long or truncated is answered with a typed error and never reaches the
+ * brain — the server survives it and keeps serving.
+ *
  * Author: Haruhito
  */
 #include "sfb_internal.h"
@@ -36,6 +46,9 @@
 #define SFB_OP_FORGET   6u
 
 #define SFB_BROKER_MAX_PAYLOAD (16u * 1024u * 1024u)
+/* Upper bound on SFB_OP_RECALL's k. The server sizes its hit array from the
+ * request, so this is a memory cap, not an array bound. */
+#define SFB_BROKER_MAX_K       1024u
 
 /* accept() waits at most this long before the stop flag is re-checked, so a
  * SIGINT/SIGTERM that lands between the loop test and accept() cannot strand
@@ -65,17 +78,56 @@ static int read_all_fd(int fd, void *buf, size_t len) {
     return SFB_OK;
 }
 
+/* ── framing helpers ───────────────────────────────────────────────────── */
+/*
+ * W2.4: every byte a client sends is accounted for before any of it is read,
+ * and every field is bounds-checked against the length the client declared.
+ * A frame that is short, long or truncated is answered with a typed error and
+ * dropped — it never reaches the brain.
+ */
+static int broker_reply(int fd, int32_t status, const void *payload, uint32_t rlen) {
+    uint32_t hdr[2];
+    if (rlen != 0 && payload == NULL) return SFB_E_NOMEM;   /* never half a frame */
+    hdr[0] = (uint32_t)status;
+    hdr[1] = rlen;
+    if (sfb_write_all(fd, hdr, sizeof hdr) != SFB_OK) return SFB_E_IO;
+    if (rlen && sfb_write_all(fd, payload, rlen) != SFB_OK) return SFB_E_IO;
+    return SFB_OK;
+}
+
+/* Answer a frame that never arrived in full, then let the caller drop it: a
+ * client that half-closed mid-frame gets a typed error instead of a bare EOF. */
+static int broker_refuse(int fd, int32_t status) {
+    (void)broker_reply(fd, status, NULL, 0u);
+    return (int)status;
+}
+
+/* Read one u32 field at `off`. The subtraction is what makes this safe: an
+ * offset and a length that would overflow 32 bits simply fail the check. */
+static int broker_get_u32(const unsigned char *payload, uint32_t plen,
+                          uint32_t off, uint32_t *out) {
+    if (payload == NULL || off > plen || plen - off < 4u) return SFB_E_INVALID;
+    memcpy(out, payload + off, 4);
+    return SFB_OK;
+}
+
 /* handle one connection; returns when the client closes or one request is served */
 static int serve_one(sfb_brain_t *b, int fd) {
     uint32_t hdr[2] = {0, 0};
     int rc = read_all_fd(fd, hdr, sizeof hdr);
-    if (rc != SFB_OK) return rc;
+    if (rc != SFB_OK) return broker_refuse(fd, SFB_E_INVALID);   /* truncated header */
     uint32_t op = hdr[0], plen = hdr[1];
-    if (plen > SFB_BROKER_MAX_PAYLOAD) return SFB_E_INVALID;
+    if (plen > SFB_BROKER_MAX_PAYLOAD) return broker_refuse(fd, SFB_E_INVALID);
 
     unsigned char *payload = plen ? malloc(plen) : NULL;
-    if (plen && !payload) return SFB_E_NOMEM;
-    if (plen) { rc = read_all_fd(fd, payload, plen); if (rc != SFB_OK) { free(payload); return rc; } }
+    if (plen && !payload) return broker_refuse(fd, SFB_E_NOMEM);
+    if (plen) {
+        rc = read_all_fd(fd, payload, plen);
+        if (rc != SFB_OK) {                     /* truncated payload            */
+            free(payload);
+            return broker_refuse(fd, SFB_E_INVALID);
+        }
+    }
 
     unsigned char *resp = NULL;
     uint32_t rlen = 0;
@@ -89,17 +141,30 @@ static int serve_one(sfb_brain_t *b, int fd) {
         break;
     }
     case SFB_OP_REMEMBER: {
-        if (plen < 4) { status = SFB_E_INVALID; break; }
-        uint32_t dim; memcpy(&dim, payload, 4);
-        if (dim < SFB_MIN_DIM || dim > SFB_MAX_DIM || plen < 4 + dim * 4 + 4) { status = SFB_E_INVALID; break; }
-        const float *vec = (const float *)(payload + 4);
-        uint32_t tl; memcpy(&tl, payload + 4 + dim * 4, 4);
-        if (plen < 4 + dim * 4 + 4 + tl) { status = SFB_E_INVALID; break; }
-        char *text = malloc(tl + 1);
+        /* u32 dim | f32[dim] | u32 text_len | text  (exactly, nothing more) */
+        uint32_t dim = 0, tl = 0;
+        uint64_t vec_bytes, text_off;
+
+        status = broker_get_u32(payload, plen, 0u, &dim);
+        if (status != SFB_OK) break;            /* plen < 4                     */
+        if (dim < SFB_MIN_DIM || dim > SFB_MAX_DIM) { status = SFB_E_INVALID; break; }
+        vec_bytes = (uint64_t)dim * 4u;
+        if ((uint64_t)plen < 4u + vec_bytes + 4u) { status = SFB_E_INVALID; break; }
+        status = broker_get_u32(payload, plen, 4u + (uint32_t)vec_bytes, &tl);
+        if (status != SFB_OK) break;
+        text_off = 8u + vec_bytes;
+        if ((uint64_t)plen != text_off + (uint64_t)tl) { status = SFB_E_INVALID; break; }
+        char *text = malloc((size_t)tl + 1u);
         if (!text) { status = SFB_E_NOMEM; break; }
-        memcpy(text, payload + 4 + dim * 4 + 4, tl); text[tl] = 0;
+        memcpy(text, payload + text_off, tl); text[tl] = 0;
         sfb_remember_result_t on = {0, 0, 0};
-        status = sfb_remember(b, vec, text, "agent", &on);
+        /* sfb_remember_ex(), never the sfb_remember() shim: the shim assumes the
+         * caller's buffer holds the *brain's* dim floats, so a payload carrying
+         * a different number of floats would be read past its end here. _ex
+         * compares vec_len with cfg.dim and returns SFB_E_DIM before it touches
+         * a single element. */
+        status = sfb_remember_ex(b, (const float *)(payload + 4), (size_t)dim,
+                                 text, "agent", &on);
         free(text);
         if (status == SFB_OK) {
             resp = malloc(sizeof on); if (resp) { memcpy(resp, &on, sizeof on); rlen = sizeof on; }
@@ -107,13 +172,23 @@ static int serve_one(sfb_brain_t *b, int fd) {
         break;
     }
     case SFB_OP_RECALL: {
-        if (plen < 8) { status = SFB_E_INVALID; break; }
-        uint32_t k, dim; memcpy(&k, payload, 4); memcpy(&dim, payload + 4, 4);
-        if (k == 0 || k > 1024 || plen < 8 + dim * 4) { status = SFB_E_INVALID; break; }
-        sfb_hit_t hits[128];
-        uint32_t n = 0;
-        status = sfb_recall(b, (const float *)(payload + 8), k, hits, &n);
+        /* u32 k | u32 dim | f32[dim]  (exactly one query vector) */
+        uint32_t k = 0, dim = 0;
+        status = broker_get_u32(payload, plen, 0u, &k);
         if (status != SFB_OK) break;
+        status = broker_get_u32(payload, plen, 4u, &dim);
+        if (status != SFB_OK) break;
+        if (k == 0 || k > SFB_BROKER_MAX_K) { status = SFB_E_INVALID; break; }
+        if (dim < SFB_MIN_DIM || dim > SFB_MAX_DIM) { status = SFB_E_INVALID; break; }
+        if ((uint64_t)plen != 8u + (uint64_t)dim * 4u) { status = SFB_E_INVALID; break; }
+        /* hits[] is sized by the request instead of a fixed 128: sfb_recall_ex
+         * writes at most k hits, and k up to 1024 used to overrun the stack. */
+        sfb_hit_t *hits = (sfb_hit_t *)calloc(k, sizeof *hits);
+        if (hits == NULL) { status = SFB_E_NOMEM; break; }
+        uint32_t n = 0;
+        status = sfb_recall_ex(b, (const float *)(payload + 8), (size_t)dim, k, hits, &n);
+        if (status != SFB_OK) { free(hits); break; }
+        if (n > k) n = k;
         size_t need = 4;
         for (uint32_t i = 0; i < n; i++) need += 16 + (hits[i].text ? strlen(hits[i].text) : 0);
         resp = malloc(need);
@@ -129,6 +204,7 @@ static int serve_one(sfb_brain_t *b, int fd) {
             }
             rlen = (uint32_t)(w - resp);
         }
+        free(hits);
         break;
     }
     case SFB_OP_FLUSH: {
@@ -150,8 +226,10 @@ static int serve_one(sfb_brain_t *b, int fd) {
         break;
     }
     case SFB_OP_FORGET: {
-        if (plen < 4) { status = SFB_E_INVALID; break; }
-        uint32_t id; memcpy(&id, payload, 4);
+        uint32_t id = 0;
+        status = broker_get_u32(payload, plen, 0u, &id);
+        if (status != SFB_OK) break;
+        if (plen != 4u) { status = SFB_E_INVALID; break; }   /* exact frame */
         status = sfb_forget(b, id);
         break;
     }
@@ -159,11 +237,7 @@ static int serve_one(sfb_brain_t *b, int fd) {
         status = SFB_E_INVALID;
     }
 
-    int werr = SFB_OK;
-    uint32_t rhdr[2] = { (uint32_t)status, rlen };
-    if (sfb_write_all(fd, rhdr, sizeof rhdr) != SFB_OK) werr = SFB_E_IO;
-    else if (rlen && sfb_write_all(fd, resp, rlen) != SFB_OK) werr = SFB_E_IO;
-
+    int werr = broker_reply(fd, status, resp, rlen);
     free(resp); free(payload);
     return werr;
 }

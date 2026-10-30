@@ -441,6 +441,119 @@ one record") and I mutation-tested it: with the mask disabled the gate fails wit
 `wrote 201 records`, with it restored it passes. The persisted bit itself was left
 alone so old builds read the same bytes.
 
+### 2026-10-30 — plan audit: every item re-checked against code, eight gaps closed
+
+The upgrade was declared finished; this pass re-audited all 43 plan items (W1.1–W7.6)
+against the shipped source with four independent adversarial readers, then fixed what
+they found. The audit's value was in what it refused to accept: comments that claimed
+behaviour, tests that could not fail, and guarantees that only held on the happy path.
+
+**Gaps that were real defects, now fixed (C module):**
+
+- **W3.5 — the per-record CRC was a decoy.** It covered only `id..strength`+text+role,
+  never the vector (~98% of a row), and could not isolate damage because the segment
+  payload CRC/digest fired first and quarantined everything. Measured before the fix:
+  one flipped bit in one vector turned 512 live records into 256; one flipped bit in a
+  text turned 256 into 0. Now each record's CRC covers the whole record behind segment
+  flag bit3 (`SFB_SEG_FLAG_RECCRC_FULL`) and replay drops exactly the damaged record.
+  After: 512 → 511, one dropped, segment not quarantined. A truncation still rejects
+  the segment as a unit, because a half-written segment is not a record-level fault.
+- **W3.3 — "lazy open" was scaffolding.** `sfb_open` still called `brain_do_load`
+  unconditionally, so `brain_ensure_loaded()` and 15 call sites were dead code and every
+  open replayed every payload. Measured 3 segments read of 3; now 0 of 3, with
+  `verify_full` still reading all 3 and a torn newest segment still failing the open
+  with `SFB_E_CORRUPT`. `segments_verified` was permanently 0; the paranoid path now
+  increments it.
+- **W3.2 — "seal at 256" was not a cap.** 256 was only an auto-flush trigger, so any
+  operation dirtying more rows wrote a bigger segment (measured 300 in one). A 1000-row
+  dirty set now seals 4 segments (256/256/256/232) and a reopen returns all 1000.
+- **W3.4 — reclamation had no trigger.** `reclaim` had one caller, `sfb_compact`, so
+  orphans were never collected and steady-state disk amplification measured 6.01x. Now
+  swept automatically on flush: 5×(decay_tick+flush) measures ~1.19x with no compact
+  call, planted `.tmp` orphans are collected, and every referenced segment survives.
+- **W5.1 — the dedup constant meant two different things.** `nh.dist` is *squared* L2,
+  so `dist < 0.05` meant Euclidean 0.2236 — 4.5x the specified radius — while the exact
+  and consolidate legs used true Euclidean 0.05 for the same constant. The graph leg now
+  compares `SFB_DEDUP_L2_SQ` (0.0025), the unit table documents which leg uses which,
+  and the invariant comment no longer claims both are Euclidean. Fewer merges as a
+  result: a pair at Euclidean 0.2 with identical text no longer folds.
+- **W5.3 — decay policy did not survive a restart.** The manifest carried no mode or
+  half-life, so an EXPONENTIAL brain reopened as NONE and silently stopped forgetting.
+  Persisted now in a 24-byte optional block behind manifest flag bit1 (format version
+  stays 2; old manifests open unchanged and are not silently upgraded). A config that
+  says nothing about decay inherits the stored policy; an explicit config wins and is
+  persisted. TTL, which had zero tests, is covered.
+- **W5.4 — the pin floor was a config knob.** `pins_immune = 0` let a pinned row decay
+  below 0.2 and be demoted to FORGOTTEN, and the existing test passed even with the
+  floor deleted (pins were skipped by decay entirely). A pin now means strength >= 0.2
+  and no demotion by decay, at either setting.
+- **W4.6 — "RRF" was outvoted.** The fusion budget was 3×(1/61) ≈ 0.049 while a +1.0
+  lexical-dominance boost and a +2.0 exact-substring boost were 20x and 41x that, so
+  boosts decided the ranking and the three lists never did. The boosts are deleted;
+  exact-phrase matches became a documented first tier (score 1.0). BM25 now uses real
+  corpus idf instead of a constant. The "vector" list is still the centroid of the top
+  lexical hits — documented as a non-independent proxy with its weight capped at 0.5.
+- **W2.3 — a read-only open wrote to the store.** It created/truncated `<brain>.lock`
+  and left a 51-byte "mode reader" record. Readers now open `O_RDONLY`, take a shared
+  flock on the existing file, and fall back to a shared flock on the *directory* when no
+  lock file exists (a directory flock creates nothing and moves no timestamps). The
+  directory is byte-identical after a read-only open, and read-only opens now succeed in
+  a 0555 directory.
+- **W2.4 — the broker could read past a client's payload.** REMEMBER trusted the client's
+  length and called the unchecked shim, so a short payload made the server read up to
+  (dim − payload_dim)·4 bytes past the buffer (ASan: heap-buffer-overflow in
+  `sfb_remember_ex`). Every opcode now validates a bound-checked length and calls the
+  `_ex` entry points; RECALL's fixed `hits[128]` also overran for k > 128 and is now
+  sized from k.
+- **W7.4 — `stats --json` lied in the one case it exists for.** On a store missing a
+  sealed segment it reported `ok:true, records_dropped:0` while `verify` reported
+  `ok:false` with 44 dropped. Stats now runs verify's detection (minus decryption),
+  reports `ok:false` with `missing_files`/`damaged_segments`, lists real generation
+  history, and prints `null` for per-process counters a cold process cannot know rather
+  than a fabricated 0.
+- **W7.5 — migrate mislabelled a real import** as "already v2", and had no `--json`.
+- **W7.3 — backup hid its link→copy fallback.** It now reports linked/copied counts,
+  bytes, and the copy reason (e.g. cross-device link).
+
+**Newly created surface:** `sofuu brain verify|repair|stats|backup|restore|migrate`
+over the runtime's own QTSQ format (the `sfb` CLI speaks a different on-disk format and
+could never read these brains). Hardlink snapshots prove inode equality; repair
+quarantines `.torn`; exit codes are 0 ok / 1 damage / 2 usage.
+
+**CI (W7.6):** `brain-chaos.yml` and `brain-tests.yml` in the parent repo (its first
+workflow files), plus an honesty change in the runtime's `ci.yml`, whose "run JS tests"
+step was vacuous because `/tests/` is gitignored. The module was cross-compiled for
+x86_64-linux-gnu to catch what a macOS-only suite cannot: `sfb_ops.c` called `flock()`
+with only `<fcntl.h>`, which is a hard error on glibc — `#include <sys/file.h>` fixed it.
+
+**Verification (this tree, after all changes):**
+```
+make test            → 16 suites + serve, 0 failures (13,637 checks)
+  util 350 · crypto 35 · store 1440 · hnsw 839 · lock 36 · text+quant
+  brain 116 · ops 70 · keys 140 · migrate 34 · dims 24 · gates 10025
+  text+quant 6 · int8 151 · w2_safety 77 · w7 92 · w3_storage 60
+  w5_semantics 115 · serve 27
+```
+Every new guarantee is mutation-tested: disabling the record-CRC isolation, the 256
+split, the reclaim trigger, the lazy-open guard, the dedup unit fix, the pin clamp, the
+decay inheritance, the consolidation label, or the fusion rewrite each fails the check
+written to pin it. The storage tests were themselves corrected when mutation exposed a
+tautology (W3.2 expected `SFB_SEGMENT_CAP` segments, so raising the constant would have
+agreed with itself; it now asserts literal 256/4).
+
+**Still open, recorded so it is not mistaken for done:**
+- W1.5's *name-reuse* half is implemented (`next_seq` stats the disk and skips existing
+  `seg-<gen>-<seq>` names) but has no test that makes a publish collide with a planted
+  file. Monotonic generation is tested.
+- W3.5 record-level isolation is unreachable on an encrypted store: the GCM tag check
+  rejects the segment before any per-record CRC is consulted, so damage degrades to
+  segment-level there. By construction, documented in `test_w3_storage.c`.
+- W5.6: the phase-2 gate says "any dim accepted"; the module deliberately accepts
+  64..4096 and rejects outside it, pinned by `test_dims.c`. The gate wording should say
+  what the code means.
+- HNSW's f32 copy caps the whole-brain heap win at ~1.63x; int8 dedup is exact-only;
+  `sfb serve` serves one client at a time and is Darwin-tested only.
+
 ### Template for new entries
 
 ```

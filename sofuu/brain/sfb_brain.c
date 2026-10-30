@@ -28,10 +28,17 @@
  *      bumps man.generation itself; manifest_save() persists the result.
  *  A3. sfb_store_quarantine() owns store.segments_quarantined (we do not bump
  *      it a second time here).
- *  A4. sfb_hnsw_search() distances are Euclidean L2 over the raw f32 vectors,
- *      matching the 0.05 thresholds this file is specified against. Only live
- *      vectors are ever added to the graph, and tombstones are re-checked on
- *      the way out, so a graph that forgets to filter deleted ids is safe.
+ *  A4. sfb_hnsw_search() distances are SQUARED Euclidean L2 (sfb_hnsw_l2()
+ *      sums (a-b)^2 and never takes a square root).  SFB_DEDUP_L2 is the
+ *      dedup RADIUS in plain Euclidean L2 — the unit sfb_consolidate() and
+ *      ti_find_exact() use through the sqrt-returning l2_dist() — so every
+ *      graph-distance comparison in this file is made against its square,
+ *      SFB_DEDUP_L2_SQ, and never against SFB_DEDUP_L2 directly (W5.1: the
+ *      two units used to be compared to each other, which made the graph leg
+ *      of the dedup gate sqrt(0.05) ≈ 0.2236 wide instead of 0.05).  Only
+ *      live vectors are ever added to the graph, and tombstones are
+ *      re-checked on the way out, so a graph that forgets to filter deleted
+ *      ids is safe.
  *  A5. sfb_hnsw_add() may not be called twice for the same id, and the graph
  *      offers no update; therefore the graph is never mutated during replay —
  *      sfb_brain_load_all() rebuilds it from live rows once all segments are
@@ -78,10 +85,30 @@
  * reproduces (c,s) exactly, and a re-flush of the same rows writes the same
  * bytes.
  *
- * The timestamps sit between the covered span and the CRC, so they ride in the
- * sealed segment without changing what the CRC covers.  The vector is not in
- * the per-record CRC in either mode (it never was); the segment payload CRC and
- * the manifest's whole-file digest cover it.
+ * W3.5 — FULL-RECORD CRC (segment flag bit3 == SFB_SEG_FLAG_RECCRC_FULL).
+ * Every segment this build writes carries the flag, and every record in it
+ * carries a CRC32C over the WHOLE record: the 24-byte semantic head, both f64
+ * timestamps, text, role and the vector payload (f32 bytes, or — int8 block —
+ * that record's f32 scale plus its dim code bytes).  Component order in the
+ * CRC is exactly: head, stamps, text, role, [scale], vector.
+ *
+ * Where the two numbers live.  The 4-byte crc slot at +40 keeps the LEGACY
+ * span (head ++ text ++ role, over the header bytes as stored), because
+ * pre-W3.5 verifiers — sfb_ops.c's per-record scan — read that slot and check
+ * that span, and a store written by this build must still verify clean with
+ * them.  The full-record CRC rides in the two words that have spare high bits:
+ * 16 bits in flags (bits 8..23, above the four SFB_F_* bits) and 16 bits in
+ * tier (bits 16..31).  Replay masks both words back to their meaning and
+ * recomputes the CRC over the MASKED head, so the stored value never depends
+ * on itself.  See SFB_REC_FLAGS_MASK / rec_head_split().
+ *
+ * A legacy segment (flag clear) keeps the legacy span in the crc slot and
+ * carries no fragments; replay dispatches on the flag, so both kinds read
+ * correctly out of one store.  What this replaces: the old text above ("the
+ * vector is not in the per-record CRC; the segment payload CRC and the
+ * manifest's whole-file digest cover it") — those two checks still fire on any
+ * flipped byte, and the full-record CRC is what then attributes the damage to
+ * one record instead of a whole 256-record segment.
  * Little-endian native (arm64 / x86-64); read back by the same file.
  * ------------------------------------------------------------------------ */
 #define SFB_REC_CRCSPAN 24u                     /* id..strength              */
@@ -92,9 +119,69 @@
 #define SFB_REC_HDR     SFB_OFF_TEXT
 #define SFB_REC_TEXT_MAX (1u << 20)
 
+/* ── full-record CRC carrying (W3.5, SFB_SEG_FLAG_RECCRC_FULL) ─────────────
+ * The 44-byte record header has no spare 32-bit word, and the 4-byte crc slot
+ * must keep describing the legacy head+text+role span: pre-W3.5 verifiers
+ * (sfb_ops.c's per-record scan) read that slot and check that span, and a
+ * store written by this build still has to verify clean with them.
+ *
+ * So the full-record CRC — head, both stamps, text, role, vector — is carried
+ * in the unused high halves of the two small enum words: 16 bits in flags
+ * (bits 8..23, above the four SFB_F_* bits) and 16 bits in tier (bits 16..31).
+ * The four-byte crc slot keeps the legacy span, computed over the header bytes
+ * as stored.  The low bits of both words keep their meaning, so `flags` and
+ * `tier` are simply masked back when replaying; the CRC itself is computed
+ * over the *masked* head, so the stored value never depends on itself.
+ *
+ * A legacy segment (flag clear) has neither the fragments nor a reason to look
+ * at them: its records carry the legacy span in the crc slot, exactly as
+ * before.  Both halves live inside the bytes the payload CRC and the manifest
+ * digest already cover, so a flipped bit in either is still caught. */
+#define SFB_REC_FLAGS_MASK 0x000000FFu          /* the four SFB_F_* bits + pad */
+#define SFB_REC_TIER_MASK  0x0000FFFFu
+
+/* Put the two fragments into a raw header copy and mask the semantic fields.
+ * *crc_out receives the stored full-record CRC (meaningless for legacy). */
+static void rec_head_split(const uint8_t raw[SFB_REC_CRCSPAN],
+                           uint8_t sem[SFB_REC_CRCSPAN], uint32_t *crc_out)
+{
+    uint32_t f_raw, t_raw;
+
+    memcpy(&f_raw, raw + 4, 4);
+    memcpy(&t_raw, raw + 8, 4);
+    memcpy(sem, raw, SFB_REC_CRCSPAN);
+    f_raw &= SFB_REC_FLAGS_MASK;
+    t_raw &= SFB_REC_TIER_MASK;
+    memcpy(sem + 4, &f_raw, 4);
+    memcpy(sem + 8, &t_raw, 4);
+    if (crc_out != NULL) {
+        uint32_t f_frag, t_frag;
+
+        memcpy(&f_frag, raw + 4, 4);
+        memcpy(&t_frag, raw + 8, 4);
+        *crc_out = (((f_frag >> 8) & 0xFFFFu) << 16) | ((t_frag >> 16) & 0xFFFFu);
+    }
+}
+
 #define SFB_RECENCY_TAU 86400.0
+/* A pinned row's strength never drops below this (W5.4: an invariant, not a
+ * function of cfg.pins_immune). */
 #define SFB_PIN_FLOOR   0.2
+/* The dedup radius, in EUCLIDEAN L2 (see A4).  One constant, one meaning:
+ *   ti_find_exact()   compares l2_dist() (already sqrt)  < SFB_DEDUP_L2
+ *   consolidate       compares l2_dist() (already sqrt)  < SFB_DEDUP_L2
+ *   remember, graph   sfb_hnsw_search() returns SQUARED L2, so it compares
+ *                     nh.dist < SFB_DEDUP_L2_SQ
+ * W5.1: the graph leg used to compare its squared distance against
+ * SFB_DEDUP_L2 itself, i.e. it accepted Euclidean < 0.2236 — 4.5x the radius
+ * the plan specifies for the very same constant. */
 #define SFB_DEDUP_L2    0.05
+#define SFB_DEDUP_L2_SQ (SFB_DEDUP_L2 * SFB_DEDUP_L2)
+/* W4.6: score offset that makes "contains the query verbatim" an explicit
+ * first tier in sfb_recall_text().  It must be larger than the maximum fused
+ * RRF score (3/61 ≈ 0.049) and nothing else; it is a tier marker, not a
+ * weight, so it is deliberately NOT comparable to the RRF budget. */
+#define SFB_FUSION_TIER_BASE 1.0
 #define SFB_GRAPH_NAME_MAX 64
 /* flushes a graph save may drift before flush() writes one again */
 #define SFB_GRAPH_SAVE_GENS 16u
@@ -1014,8 +1101,15 @@ void sfb_config_default(sfb_config_t *cfg, const char *path, uint32_t dim)
 int sfb_brain_serialize_dirty(sfb_brain_t *b, void **out, size_t *len,
                               uint32_t *n_records, uint32_t *min_id, uint32_t *max_id)
 {
+    return sfb_brain_serialize_dirty_n(b, out, len, n_records, min_id, max_id, 0u);
+}
+
+int sfb_brain_serialize_dirty_n(sfb_brain_t *b, void **out, size_t *len,
+                                uint32_t *n_records, uint32_t *min_id,
+                                uint32_t *max_id, uint32_t max_records)
+{
     sbuf_t s;
-    uint32_t i, n = 0, mn = 0xFFFFFFFFu, mx = 0;
+    uint32_t i, n = 0, mn = 0xFFFFFFFFu, mx = 0, seen = 0;
     size_t dim = b->vecs.dim;
     int quantised;
     int rc = SFB_OK;
@@ -1036,9 +1130,15 @@ int sfb_brain_serialize_dirty(sfb_brain_t *b, void **out, size_t *len,
     if (quantised && !vec_rows_available(b))
         return SFB_E_STATE;
 
+    /* W3.2: the segment cap is enforced here, in serialisation order (ascending
+     * id — the same order the unlimited form uses), so a caller that asks for
+     * at most SFB_SEGMENT_CAP rows gets exactly the next cap rows of the dirty
+     * set and the flush simply loops. */
     for (i = 0; i < b->nrec; i++) {
         if ((b->recs[i].flags & SFB_F_DIRTY) == 0)
             continue;
+        if (max_records != 0 && n >= max_records)
+            break;
         n++;
         if (b->recs[i].id < mn) mn = b->recs[i].id;
         if (b->recs[i].id > mx) mx = b->recs[i].id;
@@ -1054,54 +1154,105 @@ int sfb_brain_serialize_dirty(sfb_brain_t *b, void **out, size_t *len,
     /* W3.6: the per-record scale table sits between the count and the records,
      * so a reader parses it with one index and never scans the block twice. */
     if (quantised) {
-        for (i = 0; i < b->nrec; i++) {
+        for (i = 0; i < b->nrec && seen < n; i++) {
             if ((b->recs[i].flags & SFB_F_DIRTY) == 0)
                 continue;
             rc = sbuf_put(&s, &b->vecs.qscale[i], sizeof(float));
             if (rc != SFB_OK)
                 goto done;
+            seen++;
         }
+        seen = 0;
     }
 
-    for (i = 0; i < b->nrec; i++) {
+    for (i = 0; i < b->nrec && seen < n; i++) {
         sfb_record_t *r = &b->recs[i];
-        uint8_t head[SFB_REC_CRCSPAN];
+        uint8_t head[SFB_REC_CRCSPAN];      /* semantic head (CRC fragments clear) */
+        uint8_t whead[SFB_REC_CRCSPAN];     /* the bytes that actually go on disk  */
         uint8_t stamp[16];
-        uint32_t crc;
+        static const uint8_t zeros[64] = { 0 };
+        uint32_t crc, crc_legacy, f_sem, t_sem, f_stored, t_stored;
         const char *t;
 
         if ((r->flags & SFB_F_DIRTY) == 0)
             continue;
+        seen++;
 
         t = rec_text(b, r);
+        /* W3.5: the flags / tier words keep their meaning in the low bits; the
+         * high bits carry the two halves of the full-record CRC (see the layout
+         * note at the top of this file).  The CRC is computed over the semantic
+         * head so the stored value can never depend on itself. */
+        f_sem = r->flags & SFB_REC_FLAGS_MASK;
+        t_sem = r->tier & SFB_REC_TIER_MASK;
         memcpy(head + 0, &r->id, 4);
-        memcpy(head + 4, &r->flags, 4);
-        memcpy(head + 8, &r->tier, 4);
+        memcpy(head + 4, &f_sem, 4);
+        memcpy(head + 8, &t_sem, 4);
         memcpy(head + 12, &r->text_len, 4);
         memcpy(head + 16, &r->role_len, 4);
         memcpy(head + 20, &r->strength, 4);
         memcpy(stamp + 0, &r->created_at, 8);
         memcpy(stamp + 8, &r->last_hit, 8);
 
+        /* W3.5: the CRC covers the WHOLE record — head, both f64 timestamps,
+         * text, role and the vector payload (f32 bytes, or the int8 codes plus
+         * that record's f32 scale).  This is what lets replay attribute a
+         * flipped bit in the ~98% of the row the old CRC never saw to exactly
+         * one record.  The 4-byte crc slot itself is skipped, and the byte
+         * order here is the byte order the reader feeds crc32c_update() in:
+         * head, stamps, text, role, [scale], vector. */
         crc = sfb_crc32c(head, SFB_REC_CRCSPAN);
+        crc = sfb_crc32c_update(crc, stamp, sizeof stamp);
         crc = sfb_crc32c_update(crc, t, r->text_len);
         crc = sfb_crc32c_update(crc, rec_role(b, r), r->role_len);
-        r->crc = crc;
+        if (quantised) {
+            size_t row = (size_t)i * dim;
 
-        rc = sbuf_put(&s, head, sizeof head);
+            if (row + dim > (size_t)b->vecs.cap * dim)
+                goto done_state;
+            crc = sfb_crc32c_update(crc, &b->vecs.qscale[i], sizeof(float));
+            crc = sfb_crc32c_update(crc, b->vecs.qcodes + row, dim);
+        } else {
+            float *v = rec_vec(b, i);
+
+            if (v != NULL) {
+                crc = sfb_crc32c_update(crc, v, dim * sizeof(float));
+            } else {
+                size_t left = dim * sizeof(float);
+
+                while (left > 0) {   /* an absent row is the all-zero vector */
+                    size_t k = left > sizeof zeros ? sizeof zeros : left;
+
+                    crc = sfb_crc32c_update(crc, zeros, k);
+                    left -= k;
+                }
+            }
+        }
+
+        /* The whole-record CRC is complete now: stash its halves in the spare
+         * high bits of flags/tier, and put the legacy head+text+role CRC in the
+         * 4-byte slot so a pre-W3.5 verifier (sfb_ops.c's record scan) keeps
+         * working. */
+        f_stored = (uint32_t)(f_sem | (((crc >> 16) & 0xFFFFu) << 8));
+        t_stored = (uint32_t)(t_sem | ((crc & 0xFFFFu) << 16));
+        memcpy(whead, head, sizeof whead);
+        memcpy(whead + 4, &f_stored, 4);
+        memcpy(whead + 8, &t_stored, 4);
+        crc_legacy = sfb_crc32c(whead, SFB_REC_CRCSPAN);
+        crc_legacy = sfb_crc32c_update(crc_legacy, t, r->text_len);
+        crc_legacy = sfb_crc32c_update(crc_legacy, rec_role(b, r), r->role_len);
+        r->crc = crc_legacy;
+
+        rc = sbuf_put(&s, whead, sizeof whead);
         if (rc == SFB_OK) rc = sbuf_put(&s, stamp, sizeof stamp);
-        if (rc == SFB_OK) rc = sbuf_put(&s, &crc, sizeof crc);
+        if (rc == SFB_OK) rc = sbuf_put(&s, &crc_legacy, sizeof crc_legacy);
         if (rc == SFB_OK) rc = sbuf_put(&s, t, r->text_len);
         if (rc == SFB_OK) rc = sbuf_put(&s, rec_role(b, r), r->role_len);
         if (rc != SFB_OK)
             goto done;
 
         if (quantised) {
-            size_t row = (size_t)i * dim;
-
-            if (row + dim > (size_t)b->vecs.cap * dim)
-                goto done_state;
-            rc = sbuf_put(&s, b->vecs.qcodes + row, dim);
+            rc = sbuf_put(&s, b->vecs.qcodes + (size_t)i * dim, dim);
         } else {
             float *v = rec_vec(b, i);
 
@@ -1109,9 +1260,9 @@ int sfb_brain_serialize_dirty(sfb_brain_t *b, void **out, size_t *len,
                 rc = sbuf_put(&s, v, dim * sizeof(float));
             } else {
                 size_t k;
-                uint8_t zero[sizeof(float)] = { 0, 0, 0, 0 };
+
                 for (k = 0; k < dim; k++) {
-                    rc = sbuf_put(&s, zero, sizeof zero);
+                    rc = sbuf_put(&s, zeros, sizeof(float));
                     if (rc != SFB_OK) break;
                 }
             }
@@ -1146,8 +1297,10 @@ int sfb_brain_replay_segment(sfb_brain_t *b, const void *data, size_t len,
 /* seg_flags carries the segment header's SFB_SEG_FLAG_* bits.  Bit 1 selects
  * the int8 record block (scale table after the count, dim code bytes per
  * record); bit 0 only says the bytes arrived sealed and are already open by
- * the time they get here.  Every record is framed by (tl, rl) exactly as in
- * the f32 block, so a damaged record costs one record in either layout. */
+ * the time they get here.  Bit 3 (SFB_SEG_FLAG_RECCRC_FULL, W3.5) says the
+ * record CRC covers the whole record instead of head+text+role only.  Every
+ * record is framed by (tl, rl) exactly as in the f32 block, so a damaged
+ * record costs one record in either layout. */
 int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
                                 uint32_t records, uint16_t seg_flags)
 {
@@ -1157,7 +1310,9 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
     size_t dim = b->vecs.dim;
     char *scratch = NULL;
     size_t scratch_cap = 0;
+    float *vscratch = NULL;
     int int8_payload = (seg_flags & SFB_SEG_FLAG_INT8) != 0;
+    int full_crc = (seg_flags & SFB_SEG_FLAG_RECCRC_FULL) != 0;
     int rc = SFB_OK;
 
     if (b == NULL || (data == NULL && len != 0))
@@ -1183,12 +1338,26 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
         off = 4u;
     }
 
+    /* The f32 vector of a record starts at a byte offset derived from tl/rl, so
+     * it is not necessarily 4-byte aligned.  Forming a `const float *` there is
+     * UB (UBSan: "load of misaligned address"), so each row is copied into an
+     * aligned scratch buffer instead — one memcpy of dim*4 bytes into a row we
+     * are about to write anyway. */
+    if (!int8_payload && dim > 0) {
+        vscratch = (float *)malloc(dim * sizeof(float));
+        if (vscratch == NULL)
+            return SFB_E_NOMEM;
+    }
+
     limit = records != 0 ? (count < records ? count : records) : count;
     if (records > limit)
         dropped += records - limit;
 
     for (i = 0; i < limit; i++) {
         uint32_t id, flags, tier, tl, rl, crc_stored, crc;
+        uint8_t raw_head[SFB_REC_CRCSPAN];
+        uint8_t sem_head[SFB_REC_CRCSPAN];
+        uint32_t crc_frag = 0;
         float strength;
         double created_at, last_hit;
         size_t need, body;
@@ -1198,8 +1367,16 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
             dropped += limit - i;
             break;
         }
-        memcpy(&id, p + off + 0, 4);
-        memcpy(&flags, p + off + 4, 4);
+        memcpy(raw_head, p + off, SFB_REC_CRCSPAN);
+        if (full_crc) {
+            /* W3.5 layout: the semantic words are masked back out of the head
+             * and the full-record CRC is reassembled from their high halves. */
+            rec_head_split(raw_head, sem_head, &crc_frag);
+        } else {
+            memcpy(sem_head, raw_head, SFB_REC_CRCSPAN);
+        }
+        memcpy(&id, sem_head + 0, 4);
+        memcpy(&flags, sem_head + 4, 4);
         /* A record that is on disk is by definition not dirty, but the flag is
          * part of what the writer stored, so it comes back set.  Leaving it set
          * is not harmless: brain_mark_dirty() returns early for an already
@@ -1209,10 +1386,10 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
          * while the next real flush re-serialised the whole replayed corpus.
          * Replay therefore drops the flag: the store, not RAM, is the truth. */
         flags &= ~(uint32_t)SFB_F_DIRTY;
-        memcpy(&tier, p + off + 8, 4);
-        memcpy(&tl, p + off + 12, 4);
-        memcpy(&rl, p + off + 16, 4);
-        memcpy(&strength, p + off + 20, 4);
+        memcpy(&tier, sem_head + 8, 4);
+        memcpy(&tl, sem_head + 12, 4);
+        memcpy(&rl, sem_head + 16, 4);
+        memcpy(&strength, sem_head + 20, 4);
         memcpy(&created_at, p + off + SFB_OFF_STAMP + 0, 8);
         memcpy(&last_hit, p + off + SFB_OFF_STAMP + 8, 8);
         memcpy(&crc_stored, p + off + SFB_OFF_CRC, 4);
@@ -1225,9 +1402,31 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
             break;                            /* truncated tail              */
         }
 
-        crc = sfb_crc32c(p + off, SFB_REC_CRCSPAN);
-        crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT, tl);
-        crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT + tl, rl);
+        if (full_crc) {
+            /* head (semantic), both f64 stamps, text, role, then the vector
+             * payload — f32 bytes, or (int8) the row's f32 scale + codes. */
+            crc = sfb_crc32c(sem_head, SFB_REC_CRCSPAN);
+            crc = sfb_crc32c_update(crc, p + off + SFB_OFF_STAMP, 16);
+            crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT, tl);
+            crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT + tl, rl);
+            if (int8_payload) {
+                crc = sfb_crc32c_update(crc,
+                                        p + table + (size_t)i * sizeof(float),
+                                        sizeof(float));
+                crc = sfb_crc32c_update(crc,
+                                        p + off + SFB_OFF_TEXT + tl + rl, dim);
+            } else {
+                crc = sfb_crc32c_update(crc,
+                                        p + off + SFB_OFF_TEXT + tl + rl,
+                                        dim * sizeof(float));
+            }
+            crc_stored = crc_frag;
+        } else {
+            /* legacy span: head ++ text ++ role, exactly as before W3.5 */
+            crc = sfb_crc32c(raw_head, SFB_REC_CRCSPAN);
+            crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT, tl);
+            crc = sfb_crc32c_update(crc, p + off + SFB_OFF_TEXT + tl, rl);
+        }
 
         if (crc != crc_stored) {
             /* W3.5: one bad record costs exactly one record. */
@@ -1252,13 +1451,16 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
                                          (size_t)tl + (size_t)rl);
             src.scale = scale;
         } else {
-            src.f32 = (const float *)(p + off + need - dim * sizeof(float));
+            memcpy(vscratch, p + off + SFB_OFF_TEXT + tl + rl,
+                   dim * sizeof(float));
+            src.f32 = vscratch;
         }
 
         if (tl + rl + 2u > scratch_cap) {
             char *ns = (char *)realloc(scratch, tl + rl + 2u);
             if (ns == NULL) {
                 free(scratch);
+                free(vscratch);
                 return SFB_E_NOMEM;
             }
             scratch = ns;
@@ -1280,12 +1482,14 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
         }
         if (rc != SFB_OK) {
             free(scratch);
+            free(vscratch);
             return rc;
         }
         off += need;
     }
 
     free(scratch);
+    free(vscratch);
     if (dropped > 0) {
         b->store.records_dropped += dropped;
         brain_emit(b, "record_dropped", "{\"count\":%u}", dropped);
@@ -1293,8 +1497,17 @@ int sfb_brain_replay_segment_ex(sfb_brain_t *b, const void *data, size_t len,
     return SFB_OK;
 }
 
-/* Replay every segment into RAM. The graph is NOT built here (A7): open first
- * tries to adopt the saved topology and rebuilds only when it cannot. */
+/* Replay every segment into RAM.  The graph is NOT built here (A7): the caller
+ * first tries to adopt the saved topology and rebuilds only when it cannot.
+ *
+ * W3.5: a segment that the strict reader rejects is given a second chance.
+ * If it is still structurally intact (sfb_store_segment_read_damaged() — same
+ * length as the manifest, decodable header, authenticated if sealed) and its
+ * record CRCs attribute the damage to some records without breaking the
+ * framing, only those records are dropped.  Anything else — a length mismatch,
+ * a bad header, an unauthenticated payload, framing that does not tile, or a
+ * checksum mismatch no record explains — is a unit-level failure and is
+ * quarantined exactly as before. */
 static int brain_replay_all(sfb_brain_t *b)
 {
     uint32_t i, nseg;
@@ -1316,6 +1529,9 @@ static int brain_replay_all(sfb_brain_t *b)
         if (e->records == 0)
             continue;
 
+        /* cfg.verify_full (W3.3): the paranoid path checks each segment's
+         * payload CRC and whole-file digest before decoding it, and a segment
+         * that fails that check is quarantined as a unit. */
         if (b->cfg.verify_full) {
             rc = sfb_store_segment_verify(&b->store, e);
             if (rc != SFB_OK) {
@@ -1327,11 +1543,36 @@ static int brain_replay_all(sfb_brain_t *b)
             }
         }
 
-        /* W3.6: the payload encoding is a property of the segment, not of this
-         * brain's config — a mixed store (f32 segments written before the
-         * setting was turned on, int8 ones after) replays correctly. */
-        rc = sfb_store_segment_read_ex(&b->store, e, &data, &len, &seg_flags);
+        /* W3.6/W3.3: the payload encoding is a property of the segment, not of
+         * this brain's config (a mixed f32/int8 store replays correctly), and
+         * the structural read is what the default open uses: header, length and
+         * — when sealed — the GCM tag are validated, while the payload CRC and
+         * the manifest digest are deferred to sfb_verify() (or to the
+         * verify_full branch above).  Interior damage is still caught here,
+         * because every record carries its own full-record CRC (W3.5) and a
+         * record that fails it costs exactly that record. */
+        rc = sfb_store_segment_read_damaged(&b->store, e, &data, &len,
+                                            &seg_flags);
+        if (rc == SFB_E_NOMEM) {
+            free(data);
+            return rc;
+        }
+        if (rc == SFB_E_NOTFOUND) {
+            /* A deleted segment file is unrecoverable but still reportable: the
+             * rows are lost, the segment is not renamed anywhere (there is
+             * nothing to rename), and sfb_verify/sfb_stats_json name it. */
+            free(data);
+            b->store.records_dropped += e->records;
+            brain_emit(b, "segment_missing",
+                       "{\"gen\":%u,\"seq\":%u,\"records\":%u}",
+                       e->gen, e->seq, e->records);
+            continue;
+        }
         if (rc != SFB_OK) {
+            /* torn/truncated, an unknown format bit, or an unauthenticated
+             * payload: damage we cannot attribute to records, so the segment
+             * falls as a unit — exactly as before W3.5. */
+            free(data);
             (void)sfb_store_quarantine(&b->store, e);
             brain_emit(b, "segment_quarantined",
                        "{\"gen\":%u,\"seq\":%u,\"records\":%u}",
@@ -1344,6 +1585,9 @@ static int brain_replay_all(sfb_brain_t *b)
         if (rc == SFB_E_NOMEM)
             return rc;              /* out of memory: not a data verdict     */
         if (rc == SFB_E_CORRUPT) {
+            /* Replay only reports CORRUPT before it wrote anything (a block it
+             * cannot frame at all), so quarantining here cannot lose rows that
+             * were already imported. */
             (void)sfb_store_quarantine(&b->store, e);
             brain_emit(b, "segment_quarantined",
                        "{\"gen\":%u,\"seq\":%u,\"records\":%u}",
@@ -1354,18 +1598,49 @@ static int brain_replay_all(sfb_brain_t *b)
     return SFB_OK;
 }
 
-/* Public contract: replay the segments and rebuild the graph from live rows. */
-int sfb_brain_load_all(sfb_brain_t *b)
+/* ── W3.3: lazy load ───────────────────────────────────────────────────────
+ * A normal open reads the manifest and probes the newest segment's header; it
+ * does not replay (or digest) a single payload.  The first call that touches
+ * rows replays everything exactly once, which is why every public entry point
+ * below starts with brain_ensure_loaded().  cfg.verify_full keeps the old
+ * behaviour: open verifies and replays eagerly. */
+static int brain_do_load(sfb_brain_t *b)
 {
     int rc;
 
-    if (b == NULL)
-        return SFB_E_INVALID;
+    if (b->loaded)
+        return SFB_OK;
     rc = brain_replay_all(b);
     if (rc != SFB_OK)
         return rc;
-    /* A5: one index build over the final live set, never per-segment adds. */
-    return brain_rebuild_index(b);
+    /* A5: one index build over the final live set, never per-segment adds.
+     * A7: adopt the saved topology when it matches this row set, else rebuild.
+     * A broken graph never fails an open — segments are the truth. */
+    if (brain_try_load_graph(b) != SFB_OK) {
+        rc = brain_rebuild_index(b);
+        if (rc != SFB_OK)
+            return rc;
+    }
+    b->loaded = 1;
+    b->stats.records = b->nrec;
+    return SFB_OK;
+}
+
+static int brain_ensure_loaded(sfb_brain_t *b)
+{
+    if (b == NULL)
+        return SFB_E_INVALID;
+    if (b->loaded)
+        return SFB_OK;
+    return brain_do_load(b);
+}
+
+/* Public contract: replay the segments and rebuild the graph from live rows. */
+int sfb_brain_load_all(sfb_brain_t *b)
+{
+    if (b == NULL)
+        return SFB_E_INVALID;
+    return brain_do_load(b);
 }
 
 /* ── open / close ───────────────────────────────────────────────────────── */
@@ -1392,10 +1667,13 @@ static void brain_free_ram(sfb_brain_t *b)
 
 int sfb_open(const sfb_config_t *cfg, sfb_brain_t **out)
 {
-    uint64_t t0 = sfb_now_us();
+    uint64_t t0 = sfb_now_us(), read0 = 0;
     sfb_brain_t *b;
     char lockpath[4096];
     int rc, fresh = 0, have_lock = 0, have_store = 0;
+    int cfg_policy;
+    uint32_t verified = 0;
+    uint64_t verified0 = 0;
 
     if (cfg == NULL || out == NULL)
         return SFB_E_INVALID;
@@ -1410,15 +1688,31 @@ int sfb_open(const sfb_config_t *cfg, sfb_brain_t **out)
         return SFB_E_NOMEM;
     b->lock.fd = -1;
     b->cfg = *cfg;
+    /* W5.3: does the CALLER express a decay policy?  The frozen sfb_config_t
+     * has no "present" bit, so the rule is explicit and documented: a config
+     * is silent about decay only when every policy field is zero — decay
+     * NONE, half_life_secs <= 0, decay_floor <= 0 — exactly the shape of a
+     * memset(0) / zeroed config.  Anything else is an opinion and outranks
+     * the policy persisted in the manifest.  sfb_config_default() fills
+     * half_life (86400) and decay_floor (0.05), so "default config, then
+     * decay = SFB_DECAY_NONE" still counts as explicit: that is how a caller
+     * asks for "no forgetting" on purpose. */
+    cfg_policy = !(cfg->decay == SFB_DECAY_NONE
+                   && !(cfg->half_life_secs > 0.0)
+                   && !(cfg->decay_floor > 0.0));
     /* VECTOR_DB is a database: rows do not fade. A caller who wants forgetting
      * chooses COGNITIVE. Without this a default-constructed vector_db brain
-     * decays to FORGOTTEN and answers nothing after a few ticks. */
+     * decays to FORGOTTEN and answers nothing after a few ticks.  W5.3 keeps
+     * the override (documented in the policy block below) — it is re-asserted
+     * after the manifest policy has been resolved. */
     if (b->cfg.mode == SFB_MODE_VECTOR_DB)
         b->cfg.decay = SFB_DECAY_NONE;
     b->cfg.path = NULL;
-    if (b->cfg.half_life_secs <= 0.0)
+    if (!(b->cfg.half_life_secs > 0.0))
         b->cfg.half_life_secs = 86400.0;
-    if (b->cfg.decay_floor < 0.0)
+    /* decay_tick has always treated "<= 0" as "use the default floor", so the
+     * resolved value is written down here instead of being re-guessed later. */
+    if (!(b->cfg.decay_floor > 0.0))
         b->cfg.decay_floor = 0.05;
     if (b->cfg.dedup_text_similarity <= 0.0)
         b->cfg.dedup_text_similarity = 0.85;
@@ -1461,25 +1755,130 @@ int sfb_open(const sfb_config_t *cfg, sfb_brain_t **out)
     if (rc != SFB_OK)
         goto fail;              /* SFB_E_CORRUPT propagates: never empty     */
     have_store = 1;
+    read0 = b->store.segments_read;
+    verified0 = b->store.segments_verified;
 
-    rc = brain_replay_all(b);
-    if (rc != SFB_OK)
-        goto fail;
+    /* ── W5.3: the decay policy belongs to the brain, not to the call ─────
+     * A store configured `decay = EXPONENTIAL` used to reopen as NONE with a
+     * zeroed config and then silently never forget again.  The policy is now
+     * persisted in the manifest (see the block layout in sfb_store.c) and a
+     * config that says nothing about decay inherits it; an explicitly-passed
+     * config still wins.  Stores written before W5.3 carry no policy, so they
+     * open exactly as before (a zeroed config means NONE), and a store whose
+     * owner never configured a policy keeps the legacy manifest layout.
+     *
+     * MODE_VECTOR_DB: the override is KEPT, deliberately.  sfb.h defines that
+     * mode as "zero decay, exact retention", so the mode — not the caller's
+     * decay field — decides, and decay NONE is what gets persisted.  The
+     * consequence a caller can notice: reopening a vector_db brain without a
+     * config keeps it decay-free even if the process's default mode is
+     * COGNITIVE, because the inherited policy says NONE.  That is the honest
+     * reading of "a database does not fade". */
+    {
+        sfb_decay_policy_t *pp = &b->store.man.policy;
+        int had = pp->present;
+        int changed;
 
-    /* A7: adopt the saved topology when it matches this row set, else rebuild.
-     * A broken graph never fails an open — segments are the truth. */
-    if (brain_try_load_graph(b) != SFB_OK) {
-        rc = brain_rebuild_index(b);
+        if (!cfg_policy && had) {
+            b->cfg.decay = (sfb_decay_t)pp->mode;
+            b->cfg.half_life_secs = pp->half_life_secs;
+            b->cfg.decay_floor = pp->decay_floor;
+        }
+        if (b->cfg.mode == SFB_MODE_VECTOR_DB)
+            b->cfg.decay = SFB_DECAY_NONE;
+        if (!(b->cfg.half_life_secs > 0.0))
+            b->cfg.half_life_secs = 86400.0;
+        if (!(b->cfg.decay_floor > 0.0))
+            b->cfg.decay_floor = 0.05;
+
+        changed = !had
+               || pp->mode != (uint16_t)b->cfg.decay
+               || pp->half_life_secs != b->cfg.half_life_secs
+               || pp->decay_floor != b->cfg.decay_floor;
+        if (cfg_policy || had) {
+            pp->present = 1;
+            pp->mode = (uint16_t)b->cfg.decay;
+            pp->half_life_secs = b->cfg.half_life_secs;
+            pp->decay_floor = b->cfg.decay_floor;
+            /* Publish eagerly on a fresh store and whenever the resolved
+             * policy differs from what is on disk, so "configured once" is
+             * durable even if the brain is closed without a single row. */
+            if (!b->cfg.read_only && (fresh || changed)) {
+                rc = sfb_store_manifest_save(&b->store);
+                if (rc != SFB_OK)
+                    goto fail;
+            }
+        }
+    }
+
+    /* W3.3: what open has to prove, and what it may defer.
+     *
+     *   cfg.verify_full   the paranoid path: every segment's payload CRC, file
+     *                     digest and GCM tag are checked now, damaged segments
+     *                     are quarantined now, rows are in RAM on return.
+     *   default           the manifest was fully validated by sfb_store_open()
+     *                     (magic, version, flags, length, CRC32C), and the
+     *                     NEWEST segment's file length + header are probed
+     *                     here.  A torn write changes a file's length, so the
+     *                     worst damage still fails loudly at open; everything
+     *                     else is checked on first row access (brain_do_load)
+     *                     or on demand by sfb_verify().  No payload is read.
+     *
+     * Encrypted stores additionally authenticate their newest segment inside
+     * sfb_store_open(), because a wrong passphrase must not be mistaken for
+     * damage — that is one payload read, not a replay. */
+    if (!b->cfg.verify_full && b->store.man.nseg > 0) {
+        const sfb_seg_entry_t *newest =
+            &b->store.man.segs[b->store.man.nseg - 1];
+
+        /* The newest segment is the one a crash was most likely to interrupt.
+         * Its length is checked against the manifest here — a stat, not a
+         * read — so a torn write fails the open loudly instead of importing a
+         * silently truncated brain (W3.3).  A segment file that is *absent* is
+         * a different verdict: it is damage a report must describe
+         * (sfb_verify / sfb_stats_json name the file and its record count), so
+         * the open proceeds and replay counts the loss; only a file that exists
+         * with the wrong size means "this store is torn". */
+        rc = sfb_store_segment_probe(&b->store, newest);
+        if (rc == SFB_E_CORRUPT)
+            goto fail;
+        if (rc != SFB_OK && rc != SFB_E_NOTFOUND)
+            goto fail;
+        rc = SFB_OK;
+    }
+
+    /* ── W3.3: open is lazy ───────────────────────────────────────────────
+     * The manifest is fully validated by sfb_store_open() and the newest
+     * segment's length + header were probed above, so a normal open has
+     * already proven the store is not torn.  It must NOT replay (or digest) a
+     * single payload: brain_ensure_loaded() replays exactly once, on the
+     * first call that actually touches rows, which is why every public entry
+     * point starts with it.  Before this the call was unconditional, so every
+     * open replayed every segment and the whole b->loaded scaffolding was
+     * dead code.
+     *
+     * cfg.verify_full is the paranoid path and stays eager: every segment's
+     * payload CRC and whole-file digest are checked (damage is quarantined
+     * as a unit) and the rows are in RAM when the open returns. */
+    if (b->cfg.verify_full) {
+        rc = brain_do_load(b);
         if (rc != SFB_OK)
             goto fail;
     }
+    verified = (uint32_t)(b->store.segments_verified - verified0);
 
     b->stats.open_us = sfb_now_us() - t0;
     b->stats.records = b->nrec;
     b->stats.bytes_records = 0;         /* recomputed by stats_get           */
 
-    brain_emit(b, "open", "{\"fresh\":%d,\"records\":%u,\"dim\":%u}",
-               fresh, b->nrec, b->cfg.dim);
+    /* `records` is what is in RAM; a lazy open has replayed nothing, so it
+     * reports the manifest's count instead and says loaded=0. */
+    brain_emit(b, "open",
+               "{\"fresh\":%d,\"records\":%u,\"dim\":%u,\"loaded\":%d,"
+               "\"digests_verified\":%u,\"segments_read\":%llu}",
+               fresh, b->loaded ? b->nrec : b->store.man.count, b->cfg.dim,
+               b->loaded, verified,
+               (unsigned long long)(b->store.segments_read - read0));
     *out = b;
     return SFB_OK;
 
@@ -1604,6 +2003,9 @@ int sfb_remember_ex(sfb_brain_t *b, const float *vec, size_t vec_len,
 
     if (b->cfg.read_only)
         return SFB_E_READONLY;
+    rc = brain_ensure_loaded(b);
+    if (rc != SFB_OK)
+        return rc;
     if (b->vecs.dim != b->cfg.dim)
         return SFB_E_STATE;
 
@@ -1636,7 +2038,8 @@ int sfb_remember_ex(sfb_brain_t *b, const float *vec, size_t vec_len,
         }
     }
 
-    /* 2. near-duplicate: graph neighbour + Jaccard on the text. */
+    /* 2. near-duplicate: graph neighbour + Jaccard on the text.
+     * A4/W5.1: nh.dist is SQUARED L2, the gate is a Euclidean radius. */
     if (b->cfg.dedup_action != SFB_DEDUP_KEEP_BOTH && b->index != NULL &&
         b->nrec > 0 && sfb_hnsw_count(b->index) > 0) {
         sfb_hnsw_hit_t nh;
@@ -1644,7 +2047,7 @@ int sfb_remember_ex(sfb_brain_t *b, const float *vec, size_t vec_len,
 
         memset(&nh, 0, sizeof nh);
         if (sfb_hnsw_search(b->index, vec, 1u, SFB_DEFAULT_EFS, &nh, &got) ==
-                SFB_OK && got > 0 && nh.dist < (float)SFB_DEDUP_L2 &&
+                SFB_OK && got > 0 && nh.dist < (float)SFB_DEDUP_L2_SQ &&
             nh.id < b->nrec && rec_live_visible(&b->recs[nh.id])) {
             double j = sfb_text_jaccard(txt, rec_text(b, &b->recs[nh.id]));
 
@@ -1791,6 +2194,8 @@ int sfb_recall_ex(sfb_brain_t *b, const float *vec, size_t vec_len, uint32_t k,
         *n = 0;
     if (b == NULL || vec == NULL || hits == NULL || n == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (vec_len != (size_t)b->cfg.dim)
         return SFB_E_DIM;          /* W6.5: exact dimension, on query */
     if (k == 0)
@@ -1875,33 +2280,45 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
                     sfb_hit_t *hits, uint32_t *n)
 {
     scored_t *sc;
+    sfb_text_stats_t *stats;
     uint32_t i, nc = 0, o = 0, live = 0;
-    double avg = 1.0, total = 0.0;
 
     if (n != NULL)
         *n = 0;
     if (b == NULL || query == NULL || hits == NULL || n == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (k == 0 || query[0] == '\0' || b->nrec == 0)
         return SFB_OK;
 
     sc = (scored_t *)calloc(b->nrec, sizeof *sc);
     if (sc == NULL)
         return SFB_E_NOMEM;
+    stats = (sfb_text_stats_t *)malloc(sizeof *stats);
+    if (stats == NULL) {
+        free(sc);
+        return SFB_E_NOMEM;
+    }
 
+    /* W4.6: real idf needs corpus statistics, so the live corpus is walked
+     * once for N, the average token length and df per query term, and once
+     * more for the scores.  Two tokenisation passes per live row per query,
+     * no allocation inside the loop, exact df (not sampled).  This replaces
+     * a constant idf (ln(4/3) for every term) that could not tell a rare term
+     * from one that appears in every record. */
+    sfb_text_stats_begin(stats, query);
     for (i = 0; i < b->nrec; i++) {
         if (!rec_live_visible(&b->recs[i]))
             continue;
         live++;
-        total += (double)b->recs[i].text_len;
+        sfb_text_stats_add(stats, rec_text(b, &b->recs[i]));
     }
     if (live == 0) {
+        free(stats);
         free(sc);
         return SFB_OK;
     }
-    avg = total / (double)live;
-    if (avg < 1.0)
-        avg = 1.0;
 
     for (i = 0; i < b->nrec; i++) {
         const sfb_record_t *r = &b->recs[i];
@@ -1909,7 +2326,7 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
 
         if (!rec_live_visible(r))
             continue;
-        s = sfb_text_bm25(query, rec_text(b, r), avg, 1.2, 0.75);
+        s = sfb_text_bm25_stats(stats, rec_text(b, r), 1.2, 0.75);
         if (!(s > 0.0))
             continue;
         sc[nc].id = i;
@@ -1917,37 +2334,65 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
         sc[nc].score = s;
         nc++;
     }
+    free(stats);
     if (nc == 0) {
         free(sc);
         return SFB_OK;
     }
 
-    /* ── W4.6: reciprocal-rank fusion ───────────────────────────────────
-     * Three independent rankings are fused by rank instead of by raw score,
-     * because BM25, cosine proximity and recency are on incomparable scales
-     * (the old code divided BM25 by (1+distance), which let one list with a
-     * large range silently dominate the others):
-     *   lexical  - BM25, best first
-     *   vector   - L2 distance to the centroid of the top lexical hits, which
-     *              stands in for a query vector (sfb_recall_text has none)
-     *   recency  - most recently hit first
-     * fused = sum 1/(60 + rank), the standard RRF constant, 1-based ranks.
+    /* ── W4.6: reciprocal-rank fusion, with every boost on the rank scale ──
+     * Three rankings are fused by rank, because BM25, a vector proximity and
+     * recency are on incomparable scales (the code before W4.6 divided BM25
+     * by (1+distance), which let one list with a large range silently
+     * dominate the others):
+     *
+     *   lexical  BM25 with REAL corpus idf (sfb_text_bm25_stats), best first
+     *   vector   L2 distance to the CENTROID OF THE TOP-8 LEXICAL HITS
+     *   recency  most recently hit first
+     *
+     *   fused = Σ_list W_list / (60 + rank), 1-based ranks, k = 60.
+     *
+     * (b) The "vector" list is a PROXY, not an independent signal:
+     *     sfb_recall_text is handed text, not an embedding, so it has no query
+     *     vector to compare against; the centroid of the lexical top-8 is used
+     *     instead.  That centroid is derived from the lexical list, so a
+     *     lexical hit is close to it BY CONSTRUCTION — RRF's independence
+     *     assumption does not hold for this list.  Its weight is therefore
+     *     capped at W_VEC = 0.5, half of a real list: it re-ranks the lexical
+     *     candidates by "looks like the other good hits", it does not get an
+     *     equal vote.  (A caller with a real embedding should use
+     *     sfb_recall(), which scores the true query vector.)
+     *
+     * (a) The two absolute boosts are gone.  The whole fused budget is
+     *     W_LEX/61 + W_VEC/61 + W_REC/61 ≈ 0.041, so the old +1.0 BM25
+     *     dominance boost was ~20x and the old +2.0 exact-substring boost ~41x
+     *     the entire budget: the boosts, not the fusion, picked the winner.
+     *       • BM25 dominance: REMOVED rather than rescaled.  Rank 1 in the
+     *         lexical list already means "strongest lexical match"; a second
+     *         vote for the same fact is what outvoted the other signals.  A
+     *         record strong on two signals can now beat one strong on a single
+     *         signal (pinned by the W4.6 fusion test).
+     *       • Exact phrase: KEPT, as an explicit FIRST TIER instead of a
+     *         bonus.  A record whose text contains the query verbatim outranks
+     *         every record that does not; inside a tier the fused score
+     *         decides.  SFB_FUSION_TIER_BASE only has to exceed the maximum
+     *         fused score (3/61) to express that, so it is a tier MARKER, not
+     *         a magnitude on the fused scale — it preserves the product
+     *         decision "an exact match wins" without letting the boost
+     *         outweigh the fusion it is supposed to annotate.
      */
     {
         const double RRF_K = 60.0;
+        const double W_LEX = 1.0, W_VEC = 0.5, W_REC = 1.0;
         const uint32_t M = nc < 8u ? nc : 8u;
         const uint32_t d = b->vecs.dim;
         rk_t *rk = (rk_t *)malloc((size_t)nc * sizeof *rk);
-        double *bm = (double *)malloc((size_t)nc * sizeof *bm);
         double *cx = NULL;
         float *row = NULL;             /* dequantise scratch (int8 mode)       */
-        uint32_t best = 0, second = 0;
         int have_vec = 0, have_rec = 0;
         uint32_t j, t2;
 
-        if (rk == NULL || bm == NULL) {
-            free(rk);
-            free(bm);
+        if (rk == NULL) {
             free(sc);
             return SFB_E_NOMEM;
         }
@@ -1955,13 +2400,12 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
             row = (float *)malloc((size_t)d * sizeof(float));
             if (row == NULL) {
                 free(rk);
-                free(bm);
                 free(sc);
                 return SFB_E_NOMEM;
             }
         }
 
-        /* centroid = the query's vector stand-in */
+        /* centroid = the query's vector stand-in (see (b) above) */
         if (row != NULL && vec_rows_available(b) && d != 0) {
             uint32_t used = 0;
             cx = (double *)calloc(d, sizeof *cx);
@@ -1986,21 +2430,12 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
         }
 
         for (i = 0; i < nc; i++) {
-            bm[i] = sc[i].score;                     /* raw BM25, kept for the guard */
             rk[i].idx = i;
-            rk[i].key = sc[i].score;
+            rk[i].key = sc[i].score;                 /* raw BM25             */
         }
         qsort(rk, nc, sizeof *rk, rk_desc);
         for (i = 0; i < nc; i++)
-            sc[rk[i].idx].score = 1.0 / (RRF_K + (double)(i + 1));
-
-        /* An unambiguous lexical winner is never outvoted by fusion: when its
-         * BM25 is far ahead of the runner-up, the other lists must not demote an
-         * exact match. */
-        best = rk[0].idx;
-        second = rk[1].idx;
-        if (nc > 1u && bm[best] >= 1.5 * bm[second])
-            sc[best].score += 1.0;
+            sc[rk[i].idx].score = W_LEX / (RRF_K + (double)(i + 1));
 
         if (have_vec) {
             for (i = 0; i < nc; i++) {
@@ -2021,7 +2456,8 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
             }
             qsort(rk, nc, sizeof *rk, rk_asc);
             for (i = 0; i < nc; i++)
-                sc[rk[i].idx].score += 1.0 / (RRF_K + (double)(i + 1));
+                sc[rk[i].idx].score +=
+                    W_VEC / (RRF_K + (double)(i + 1));
         }
         free(cx);
 
@@ -2036,20 +2472,21 @@ int sfb_recall_text(sfb_brain_t *b, const char *query, uint32_t k,
         if (have_rec) {
             qsort(rk, nc, sizeof *rk, rk_desc);
             for (i = 0; i < nc; i++)
-                sc[rk[i].idx].score += 1.0 / (RRF_K + (double)(i + 1));
+                sc[rk[i].idx].score +=
+                    W_REC / (RRF_K + (double)(i + 1));
         }
-        /* Exact-phrase boost: a record containing the query verbatim outranks
-         * a merely statistical match. Without this, a query whose terms all
-         * appear in several records ties on BM25 and the winner falls to
-         * whichever list happens to be freshest. */
+        /* Exact-phrase FIRST TIER (see (a) above).  SFB_FUSION_TIER_BASE is a
+         * tier marker, chosen to exceed the maximum fused score 3/61 ≈ 0.049
+         * so that "tier first, fused score second" is also "score descending".
+         * The value has no meaning on the fused scale and must not be tuned
+         * like a weight. */
         for (i = 0; i < nc; i++) {
             const char *txt = rec_text(b, &b->recs[sc[i].id]);
             if (txt != NULL && strcasestr(txt, query) != NULL)
-                sc[i].score += 2.0;
+                sc[i].score += SFB_FUSION_TIER_BASE;
         }
 
         free(rk);
-        free(bm);
         free(row);
 
         qsort(sc, nc, sizeof *sc, cmp_scored);
@@ -2077,6 +2514,8 @@ int sfb_list(sfb_brain_t *b, uint64_t offset, uint32_t limit,
         *n = 0;
     if (b == NULL || n == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (limit == 0)
         return SFB_OK;
     if (out == NULL)
@@ -2109,6 +2548,8 @@ int sfb_forget(sfb_brain_t *b, uint32_t id)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
     if (id >= b->nrec || !rec_live(&b->recs[id]))
@@ -2130,6 +2571,8 @@ int sfb_pin(sfb_brain_t *b, uint32_t id, int pinned)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
     if (id >= b->nrec || !rec_live(&b->recs[id]))
@@ -2158,6 +2601,8 @@ int sfb_decay_tick(sfb_brain_t *b, uint64_t seconds)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
     if (b->cfg.decay == SFB_DECAY_NONE)
@@ -2169,12 +2614,14 @@ int sfb_decay_tick(sfb_brain_t *b, uint64_t seconds)
 
     for (i = 0; i < b->nrec; i++) {
         sfb_record_t *r = &b->recs[i];
+        int pinned = rec_pinned(r);
 
         if (!rec_live_visible(r))
             continue;
 
-        if (rec_pinned(r) && b->cfg.pins_immune) {
-            /* Pins never demote and never sink below the floor. */
+        if (pinned && b->cfg.pins_immune) {
+            /* Immune pins never decay, never expire and never demote, and are
+             * held at or above the floor every tick. */
             if (r->strength < (float)SFB_PIN_FLOOR) {
                 r->strength = (float)SFB_PIN_FLOOR;
                 brain_mark_dirty(b, i);
@@ -2210,6 +2657,23 @@ int sfb_decay_tick(sfb_brain_t *b, uint64_t seconds)
             }
         }
 
+        /* W5.4 — the pin floor is an invariant, not a config knob.  A pinned
+         * row is a kept row: with pins_immune = 1 it does not decay at all
+         * (branch above); with pins_immune = 0 it does fade, but its strength
+         * is clamped back to SFB_PIN_FLOOR every tick and decay never demotes
+         * it to FORGOTTEN.  Before this, pins_immune = 0 let a pin sink below
+         * the floor and be demoted, i.e. a pin stopped meaning anything.
+         * (TTL is a hard retention deadline, not a strength: a non-immune pin
+         * can still expire — that is what pins_immune = 0 asks for.) */
+        if (pinned) {
+            if (r->strength < (float)SFB_PIN_FLOOR) {
+                r->strength = (float)SFB_PIN_FLOOR;
+                brain_mark_dirty(b, i);
+                changed++;
+            }
+            continue;
+        }
+
         /* The fix for "listed but unrecallable": anything under the floor is
          * FORGOTTEN *in RAM*, so sfb_list and sfb_recall agree on liveness. */
         if (r->strength < (float)floor_v) {
@@ -2231,11 +2695,16 @@ int sfb_decay_tick(sfb_brain_t *b, uint64_t seconds)
 /* ── retain: drop sub-floor rows for real ───────────────────────────────── */
 static int brain_should_drop(const sfb_brain_t *b, const sfb_record_t *r)
 {
+    (void)b;                             /* pins no longer consult cfg        */
     if (r->flags & SFB_F_TOMBSTONE)
         return 1;
     if (!rec_live(r))
         return 1;                        /* inert hole: no payload worth it    */
-    if (rec_pinned(r) && b->cfg.pins_immune)
+    /* A pin protects a row from physical retention, whatever pins_immune says
+     * (W5.4: the floor keeps a pin out of FORGOTTEN, so this is the matching
+     * guarantee for sfb_retain).  sfb_forget() clears the pin, so explicit
+     * forgetting still drops it. */
+    if (rec_pinned(r))
         return 0;
     return r->tier == SFB_TIER_FORGOTTEN;
 }
@@ -2254,6 +2723,8 @@ int sfb_retain(sfb_brain_t *b)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
 
@@ -2410,6 +2881,8 @@ int sfb_consolidate(sfb_brain_t *b)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
     if (!vec_rows_available(b) || b->nrec < 2)
@@ -2608,10 +3081,40 @@ static uint64_t brain_logical_bytes(const sfb_brain_t *b)
     return total;
 }
 
+/* W3.2: clear the dirty flag on the first n dirty rows in serialisation order
+ * (ascending id — the order sfb_brain_serialize_dirty_n() selects in), so the
+ * next chunk of a split flush starts where this one stopped.  The dirty queue
+ * is advisory (the flag is the truth), so the count just shrinks. */
+static void brain_clear_dirty_prefix(sfb_brain_t *b, uint32_t n)
+{
+    uint32_t i, left = 0;
+
+    for (i = 0; i < b->nrec && n > 0; i++) {
+        if ((b->recs[i].flags & SFB_F_DIRTY) == 0)
+            continue;
+        b->recs[i].flags &= ~SFB_F_DIRTY;
+        n--;
+    }
+    /* Rebuild the queue so dirty_ids[0..dirty_count) is again exactly the dirty
+     * set (the serialiser scans flags, but brain_mark_dirty() appends at
+     * dirty_count, so the two must agree).  The capacity never shrinks, so this
+     * cannot fail. */
+    for (i = 0; i < b->nrec; i++) {
+        if ((b->recs[i].flags & SFB_F_DIRTY) == 0)
+            continue;
+        if (b->dirty_ids != NULL && left < b->dirty_head)
+            b->dirty_ids[left] = i;
+        left++;
+    }
+    b->dirty_count = left;
+}
+
 int sfb_flush(sfb_brain_t *b, sfb_flush_result_t *res)
 {
     uint64_t t0 = sfb_now_us();
-    uint64_t written = 0, sealed = 0, bytes = 0;
+    uint64_t written = 0, sealed = 0, bytes = 0, removed = 0;
+    uint32_t material = 0, dirty_material = 0, first_new = 0;
+    int supersede = 0;
     int rc = SFB_OK;
 
     if (res != NULL)
@@ -2620,30 +3123,97 @@ int sfb_flush(sfb_brain_t *b, sfb_flush_result_t *res)
         return SFB_E_INVALID;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
+    rc = brain_ensure_loaded(b);
+    if (rc != SFB_OK)
+        return rc;
 
+    first_new = b->store.man.nseg;
+
+    /* W3.4: does this flush capture the complete material row set?  A "hole"
+     * (flags == 0) is an id the brain never wrote, so it needs no coverage.
+     * When every other row is dirty, the segments this flush writes supersede
+     * every older segment: they carry the current state of the whole corpus. */
+    {
+        uint32_t i;
+
+        for (i = 0; i < b->nrec; i++) {
+            if (b->recs[i].flags == 0)
+                continue;
+            material++;
+            if (b->recs[i].flags & SFB_F_DIRTY)
+                dirty_material++;
+        }
+        supersede = (material > 0 && dirty_material == material &&
+                     b->dirty_count > 0);
+    }
+
+    /* W3.2: one segment per SFB_SEGMENT_CAP dirty rows.  A decay_tick that
+     * dirties 1000 rows therefore produces four segments of 256/256/256/232,
+     * not one 1000-record segment. */
     if (b->dirty_count > 0) {
-        void *buf = NULL;
-        size_t len = 0;
-        uint32_t nrec = 0, mn = 0, mx = 0, seq = 0;
+        uint32_t guard = 0;
 
-        rc = sfb_brain_serialize_dirty(b, &buf, &len, &nrec, &mn, &mx);
-        if (rc != SFB_OK)
-            goto finish;
+        while (b->dirty_count > 0) {
+            void *buf = NULL;
+            size_t len = 0;
+            uint32_t nrec = 0, mn = 0, mx = 0, seq = 0;
 
-        if (nrec > 0 && len > 0) {
-            rc = sfb_store_segment_write(&b->store, buf, len, nrec, mn, mx,
-                                         &seq);
+            rc = sfb_brain_serialize_dirty_n(b, &buf, &len, &nrec, &mn, &mx,
+                                             SFB_SEGMENT_CAP);
             if (rc != SFB_OK) {
-                /* SFB_E_ENOSPC / SFB_E_CORRUPT travel to the caller intact. */
                 free(buf);
                 goto finish;
             }
-            written = nrec;
-            sealed = 1;
-            bytes = (uint64_t)len;
-            b->store.bytes_written += bytes;
+            if (nrec == 0 || len == 0) {
+                free(buf);
+                break;
+            }
+            /* W3.5: the block this build writes carries full-record CRCs, and
+             * the segment header flag says so. */
+            rc = sfb_store_segment_write_ex(&b->store, buf, len, nrec, mn, mx,
+                                            SFB_SEG_FLAG_RECCRC_FULL, &seq);
+            free(buf);
+            if (rc != SFB_OK) {
+                /* SFB_E_ENOSPC / SFB_E_CORRUPT travel to the caller intact. */
+                goto finish;
+            }
+            written += nrec;
+            sealed++;
+            bytes += (uint64_t)len;
+            b->store.bytes_written += (uint64_t)len;
+            brain_clear_dirty_prefix(b, nrec);
+            if (++guard > SFB_MAX_SEGS) {
+                rc = SFB_E_STATE;       /* cannot make progress: stop          */
+                goto finish;
+            }
         }
-        free(buf);
+    }
+
+    /* W3.4: a publish that supersedes files drops them from the manifest and
+     * asks for a sweep.  This is the auto-compaction of the steady state
+     * (decay_tick dirties everything, flush rewrites everything), and it is
+     * what keeps disk amplification at ~1x without sfb_compact().  The two
+     * manifest saves are individually atomic: a crash in between leaves a
+     * manifest that references old *and* new segments, which replay reads
+     * correctly because it upserts by id in manifest order. */
+    if (supersede && first_new > 0 && b->store.man.nseg > first_new) {
+        uint32_t keep = b->store.man.nseg - first_new, j;
+        uint64_t keep_bytes = 0;
+
+        for (j = 0; j < keep; j++)
+            keep_bytes += b->store.man.segs[first_new + j].length;
+        memmove(&b->store.man.segs[0], &b->store.man.segs[first_new],
+                (size_t)keep * sizeof b->store.man.segs[0]);
+        b->store.man.nseg = keep;
+        b->store.man.count = (uint32_t)written;
+        b->store.man.total_bytes = keep_bytes;
+        rc = sfb_store_manifest_save(&b->store);
+        if (rc != SFB_OK) {
+            /* RAM and disk disagree: resync to what is durable and report. */
+            (void)sfb_store_manifest_load(&b->store);
+            goto finish;
+        }
+        sfb_store_reclaim_request(&b->store);
     }
 
     /* A8: the graph is a cache, not the truth. Segments alone are durable, so
@@ -2663,6 +3233,13 @@ int sfb_flush(sfb_brain_t *b, sfb_flush_result_t *res)
      * the next flush retries them (replay upserts by id, so a retry is safe). */
     if (b->dirty_count > 0)
         brain_clear_dirty(b);
+
+    /* W3.4: collect whatever the publish just made unreferenced.  Only a sweep
+     * that was asked for runs, so the directory is not scanned every flush. */
+    if (sfb_store_reclaim_auto(&b->store, &removed) == SFB_OK && removed > 0) {
+        brain_emit(b, "reclaim", "{\"files_removed\":%llu}",
+                   (unsigned long long)removed);
+    }
 
 finish:
     b->stats.flushes++;
@@ -2698,6 +3275,8 @@ int sfb_compact(sfb_brain_t *b, uint64_t *bytes_before, uint64_t *bytes_after)
 
     if (b == NULL)
         return SFB_E_INVALID;
+    if (brain_ensure_loaded(b) != SFB_OK)
+        return SFB_E_CORRUPT;
     if (b->cfg.read_only)
         return SFB_E_READONLY;
 
@@ -2733,7 +3312,8 @@ int sfb_compact(sfb_brain_t *b, uint64_t *bytes_before, uint64_t *bytes_after)
 
         rc = sfb_brain_serialize_dirty(b, &buf, &len, &wrote, &mn, &mx);
         if (rc == SFB_OK && wrote > 0 && len > 0)
-            rc = sfb_store_segment_write(&b->store, buf, len, wrote, mn, mx, &seq);
+            rc = sfb_store_segment_write_ex(&b->store, buf, len, wrote, mn, mx,
+                                            SFB_SEG_FLAG_RECCRC_FULL, &seq);
         free(buf);
         if (rc != SFB_OK)
             return rc;              /* old manifest is still the live one     */
@@ -2807,6 +3387,9 @@ int sfb_count(const sfb_brain_t *b, uint64_t *live)
         *live = 0;
     if (b == NULL || live == NULL)
         return SFB_E_INVALID;
+    /* W3.3: counting rows is a read, so it materialises the lazy store. */
+    if (brain_ensure_loaded((sfb_brain_t *)b) != SFB_OK)
+        return SFB_E_CORRUPT;
 
     *live = live_count(b);
     return SFB_OK;
@@ -2819,6 +3402,9 @@ int sfb_stats_get(const sfb_brain_t *b, sfb_stats_t *out)
 
     if (b == NULL || out == NULL)
         return SFB_E_INVALID;
+    /* W3.3: stats are a read, so they materialise the lazy store. */
+    if (brain_ensure_loaded((sfb_brain_t *)b) != SFB_OK)
+        return SFB_E_CORRUPT;
 
     for (i = 0; i < b->nrec; i++) {
         const sfb_record_t *r = &b->recs[i];

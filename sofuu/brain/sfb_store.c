@@ -28,7 +28,29 @@
  *   40    8  total_bytes
  *   48   32*nseg  { gen u32, seq u32, records u32, length u64,
  *                   digest u32, min_id u32, max_id u32 }
+ *   ..   24  [OPTIONAL decay policy block — only when flags bit1 is set,
+ *               W5.3]
  *   ..    4  crc32c of [0, ..)
+ *
+ * DECAY POLICY BLOCK (W5.3; present only when manifest flags bit1 is set)
+ *    0    4  magic   = SFB_MAGIC_POLICY ('SFP2')
+ *    4    2  version = 1
+ *    6    2  decay mode (sfb_decay_t: 0 NONE, 1 EXPONENTIAL, 2 TTL)
+ *    8    8  half_life_secs  (IEEE-754 f64, little-endian)
+ *   16    8  decay_floor     (IEEE-754 f64, little-endian)
+ *
+ *   Why an optional block instead of a version bump: the manifest version
+ *   field is part of the frozen on-disk contract (SFB_FORMAT_VERSION, and the
+ *   store tests read the byte), so it stays 2.  The extension is discriminated
+ *   by a spare flag bit and is written only when a policy actually exists, so
+ *   (a) every store written before W5.3 still loads unchanged, and (b) a store
+ *   whose owner never configured a decay policy is still written in the old
+ *   layout, byte for byte, and stays readable by older builds.  A reader that
+ *   does not know bit1 sees a length it cannot account for and fails with
+ *   SFB_E_CORRUPT (loud), never by misreading the segment table; a reader that
+ *   knows the bit but meets a bad magic/version/mode does the same.  Bit 2 of
+ *   the manifest flags word stays unassigned on purpose: unknown bits are a
+ *   loud rejection.
  *
  * SEGMENT   (immutable once published)
  *    0    4  magic   = SFB_MAGIC_SEGMENT
@@ -41,6 +63,13 @@
  *                           owns the record-block layout, and a reader that
  *                           does not know bit1 rejects the segment with
  *                           SFB_E_CORRUPT instead of misparsing it.
+ *                    bit3 = SFB_SEG_FLAG_RECCRC_FULL (W3.5): each record's
+ *                           stored CRC32C covers the whole record — head,
+ *                           both f64 timestamps, text, role and the vector
+ *                           payload — instead of head+text+role only.  The
+ *                           flag is per segment, so a store mixing legacy and
+ *                           new segments reads both; a legacy segment keeps the
+ *                           legacy span and is still accepted.
  *                    any other bit = unknown format ⇒ SFB_E_CORRUPT
  *    8    4  dim
  *   12    4  records
@@ -56,6 +85,21 @@
  *   flags = bit0|bit1 and the same open path.
  *
  *   manifest.digest = CRC32C of the whole file, header included.
+ *
+ *   W3.5 — what damage costs.  The segment-level checks (payload CRC, whole-file
+ *   digest, GCM tag) still run first and still describe a *torn* segment as
+ *   damage: a file whose length disagrees with the manifest, whose header does
+ *   not decode, or whose GCM tag does not authenticate is rejected as a unit
+ *   and quarantined.  But once a segment is structurally intact and its flag
+ *   word says bit3, an interior record that fails its own full-record CRC is
+ *   attributable to that record alone, so sfb_store_segment_read_damaged()
+ *   hands the payload to the brain's replay path and the brain imports every
+ *   other record.  These bytes are never rewritten: the segment stays
+ *   referenced, the same record is dropped on every replay, and
+ *   `sfb verify` keeps reporting the digest mismatch until repair drops the
+ *   segment.  Sealed payloads are the exception — AES-GCM authenticates the
+ *   whole payload, so a flipped byte inside one record cannot be attributed to
+ *   that record and the segment is quarantined as a unit (W3.5 tradeoff).
  *
  * WAL
  *    0    4  magic = SFB_MAGIC_WAL
@@ -85,6 +129,20 @@
  *      own random IV, the AAD is the segment header, and open authenticates
  *      the newest segment so a wrong passphrase is reported as damage-free
  *      corruption instead of being handed to a repair path that quarantines.
+ *  R5. Reclamation is automatic but event-driven (W3.4).  A segment / graph
+ *      file is deleted only when no manifest entry references it and it is not
+ *      part of the newest generation, and the directory is scanned only when
+ *      something asked for a sweep: a publish that supersedes older files, a
+ *      quarantine, a failed .tmp write, or an open (which is where a crash
+ *      leaves its .tmp / .quarantine litter).  Stale `.tmp` and `.quarantine`
+ *      siblings of a segment are collected by the same rule.
+ *  R6. Open verifies the manifest, not the world (W3.3).  A writer or reader
+ *      open loads the manifest (magic, version, flags, length, CRC) and probes
+ *      the NEWEST segment's file length + header, and nothing else: payload
+ *      digests are checked when a segment is actually replayed (first data
+ *      access) or on demand by sfb_verify().  cfg.verify_full restores the
+ *      paranoid eager scrub.  A torn newest segment changes its file length, so
+ *      the probe keeps that a loud SFB_E_CORRUPT at open.
  *
  * Archive Author: Haruhito
  */
@@ -92,18 +150,20 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <math.h>
 
-/* ── format geometry ─────────────────────────────────────────────────────  */
-#define SFB_MAN_HDR_LEN   48u
-#define SFB_MAN_ENT_LEN   32u
+/* ── format geometry ─────────────────────────────────────────────────────
+ * SFB_MAN_HDR_LEN / SFB_MAN_ENT_LEN / the manifest flag bits / the policy
+ * block geometry live in sfb_internal.h (W5.3), next to sfb_manifest_t. */
 #define SFB_SEG_HDR_LEN   48u
 #define SFB_WAL_HDR_LEN   24u
 
-#define SFB_MAN_F_ENCRYPTED 0x0001u
-/* Segment flag names live in sfb_internal.h (W3.6): SFB_SEG_FLAG_SEALED and
- * SFB_SEG_FLAG_INT8.  The mask below is the complete set this build can read;
- * anything else is a format it does not understand. */
-#define SFB_SEG_FLAGS_KNOWN (SFB_SEG_FLAG_SEALED | SFB_SEG_FLAG_INT8)
+/* Segment flag names live in sfb_internal.h (W3.6, W3.5): SFB_SEG_FLAG_SEALED,
+ * SFB_SEG_FLAG_INT8 and SFB_SEG_FLAG_RECCRC_FULL.  The mask below is the
+ * complete set this build can read; anything else — including bit 2, which is
+ * deliberately unassigned — is a format it does not understand. */
+#define SFB_SEG_FLAGS_KNOWN \
+    (SFB_SEG_FLAG_SEALED | SFB_SEG_FLAG_INT8 | SFB_SEG_FLAG_RECCRC_FULL)
 
 /* KDF salt.  The frozen manifest and sfb_store_t have no salt field, so the
  * salt is a fixed, path-independent domain separator.  It is deliberately NOT
@@ -150,6 +210,25 @@ static uint32_t get_u32(const uint8_t *p)
 static uint64_t get_u64(const uint8_t *p)
 {
     return (uint64_t)get_u32(p) | ((uint64_t)get_u32(p + 4) << 32);
+}
+
+/* f64 via its IEEE-754 bit pattern.  Little-endian on disk like every other
+ * field; host == arm64/x86-64, both IEEE-754 binary64 little-endian. */
+static void put_f64(uint8_t *p, double v)
+{
+    uint64_t bits = 0;
+
+    memcpy(&bits, &v, sizeof bits);
+    put_u64(p, bits);
+}
+
+static double get_f64(const uint8_t *p)
+{
+    uint64_t bits = get_u64(p);
+    double v = 0.0;
+
+    memcpy(&v, &bits, sizeof v);
+    return v;
 }
 
 static int st_errno(int e)
@@ -303,8 +382,26 @@ int sfb_store_manifest_save(sfb_store_t *s)
         return SFB_E_CAPACITY;
     if (s->man.dim == 0 || s->man.dim > SFB_MAX_DIM)
         return SFB_E_INVALID;            /* never publish an unopenable brain */
+    /* W5.3: a policy block is only written when there is a policy, and only
+     * when it describes something a reader can apply.  Refusing here keeps
+     * "never publish an unopenable brain" true for the extension too. */
+    if (s->man.policy.present) {
+        if (s->man.policy.mode > (uint16_t)SFB_DECAY_TTL)
+            return SFB_E_INVALID;
+        if (!isfinite(s->man.policy.half_life_secs)
+            || s->man.policy.half_life_secs <= 0.0
+            || !isfinite(s->man.policy.decay_floor)
+            || s->man.policy.decay_floor < 0.0)
+            return SFB_E_INVALID;
+    }
+    /* Keep the in-memory flags word and the encoded one in step. */
+    if (s->man.policy.present)
+        s->man.flags = (uint16_t)(s->man.flags | SFB_MAN_F_POLICY);
+    else
+        s->man.flags = (uint16_t)(s->man.flags & ~SFB_MAN_F_POLICY);
 
-    total = (size_t)SFB_MAN_HDR_LEN + (size_t)s->man.nseg * SFB_MAN_ENT_LEN + 4u;
+    total = (size_t)SFB_MAN_HDR_LEN + (size_t)s->man.nseg * SFB_MAN_ENT_LEN
+          + (s->man.policy.present ? SFB_MAN_POLICY_LEN : 0u) + 4u;
     buf = (uint8_t *)calloc(1, total);
     if (buf == NULL)
         return SFB_E_NOMEM;
@@ -333,6 +430,16 @@ int sfb_store_manifest_save(sfb_store_t *s)
         put_u32(q + 24, e->min_id);
         put_u32(q + 28, e->max_id);
         off += SFB_MAN_ENT_LEN;
+    }
+    if (s->man.policy.present) {
+        uint8_t *q = buf + off;
+
+        put_u32(q + 0, SFB_MAGIC_POLICY);
+        put_u16(q + 4, (uint16_t)SFB_POLICY_VERSION);
+        put_u16(q + 6, s->man.policy.mode);
+        put_f64(q + 8, s->man.policy.half_life_secs);
+        put_f64(q + 16, s->man.policy.decay_floor);
+        off += SFB_MAN_POLICY_LEN;
     }
     put_u32(buf + off, sfb_crc32c(buf, off));
     off += 4;
@@ -387,9 +494,10 @@ int sfb_store_manifest_load(sfb_store_t *s)
     sfb_manifest_t m;
     sfb_seg_entry_t *segs = NULL;
     uint8_t *buf = NULL;
+    uint16_t flags = 0;
     uint32_t nseg = 0, i;
     size_t size, expect;
-    int fd, rc;
+    int has_policy = 0, fd, rc;
 
     if (s == NULL)
         return SFB_E_INVALID;
@@ -401,7 +509,8 @@ int sfb_store_manifest_load(sfb_store_t *s)
     if (st.st_size < (off_t)(SFB_MAN_HDR_LEN + 4u))
         return SFB_E_CORRUPT;            /* truncated / zero-length          */
     if ((uint64_t)st.st_size
-        > (uint64_t)SFB_MAN_HDR_LEN + (uint64_t)SFB_MAX_SEGS * SFB_MAN_ENT_LEN + 4u)
+        > (uint64_t)SFB_MAN_HDR_LEN + (uint64_t)SFB_MAX_SEGS * SFB_MAN_ENT_LEN
+          + (uint64_t)SFB_MAN_POLICY_LEN + 4u)
         return SFB_E_CORRUPT;
 
     size = (size_t)st.st_size;
@@ -431,17 +540,23 @@ int sfb_store_manifest_load(sfb_store_t *s)
         free(buf);
         return SFB_E_CORRUPT;
     }
-    if (get_u16(buf + 6) & ~SFB_MAN_F_ENCRYPTED) {
+    /* The manifest version stays 2: the W5.3 decay policy is an OPTIONAL
+     * block, advertised by bit1 and absent from every store written before it.
+     * An unknown flag bit is therefore a format this build cannot read. */
+    flags = get_u16(buf + 6);
+    if (flags & ~SFB_MAN_FLAGS_KNOWN) {
         free(buf);
         return SFB_E_CORRUPT;
     }
+    has_policy = (flags & SFB_MAN_F_POLICY) != 0;
 
     nseg = get_u32(buf + 36);
     if (nseg > SFB_MAX_SEGS) {
         free(buf);
         return SFB_E_CORRUPT;
     }
-    expect = (size_t)SFB_MAN_HDR_LEN + (size_t)nseg * SFB_MAN_ENT_LEN + 4u;
+    expect = (size_t)SFB_MAN_HDR_LEN + (size_t)nseg * SFB_MAN_ENT_LEN
+           + (has_policy ? SFB_MAN_POLICY_LEN : 0u) + 4u;
     if (size != expect) {
         free(buf);
         return SFB_E_CORRUPT;
@@ -454,7 +569,7 @@ int sfb_store_manifest_load(sfb_store_t *s)
     memset(&m, 0, sizeof m);
     m.magic = get_u32(buf + 0);
     m.version = get_u16(buf + 4);
-    m.flags = get_u16(buf + 6);
+    m.flags = flags;
     m.dim = get_u32(buf + 8);
     m.count = get_u32(buf + 12);
     m.generation = get_u64(buf + 16);
@@ -468,6 +583,38 @@ int sfb_store_manifest_load(sfb_store_t *s)
     if (m.dim == 0 || m.dim > SFB_MAX_DIM) {
         free(buf);
         return SFB_E_CORRUPT;
+    }
+
+    /* W5.3 decay policy: authenticated by the same CRC, so a malformed block
+     * means the writer was broken (a version this build does not know, or a
+     * mode/half-life it could not apply) — say so loudly instead of silently
+     * opening the brain with the wrong forgetting behaviour. */
+    if (has_policy) {
+        const uint8_t *q = buf + SFB_MAN_HDR_LEN
+                         + (size_t)nseg * SFB_MAN_ENT_LEN;
+        uint16_t mode = 0;
+        double hl = 0.0, floor_v = 0.0;
+
+        if (get_u32(q + 0) != SFB_MAGIC_POLICY
+            || get_u16(q + 4) != (uint16_t)SFB_POLICY_VERSION) {
+            free(segs);
+            free(buf);
+            return SFB_E_CORRUPT;
+        }
+        mode = get_u16(q + 6);
+        hl = get_f64(q + 8);
+        floor_v = get_f64(q + 16);
+        if (mode > (uint16_t)SFB_DECAY_TTL
+            || !isfinite(hl) || hl <= 0.0
+            || !isfinite(floor_v) || floor_v < 0.0) {
+            free(segs);
+            free(buf);
+            return SFB_E_CORRUPT;
+        }
+        m.policy.present = 1;
+        m.policy.mode = mode;
+        m.policy.half_life_secs = hl;
+        m.policy.decay_floor = floor_v;
     }
 
     if (nseg > 0) {
@@ -651,6 +798,16 @@ int sfb_store_open(sfb_store_t *s, const sfb_config_t *cfg, int *fresh)
             return SFB_E_CORRUPT;        /* intact bytes, wrong passphrase   */
         }
     }
+
+    /* W3.4: a writer sweeps once per open.  This is where a crash leaves its
+     * litter — an interrupted flush's .tmp, a .quarantine from an earlier
+     * repair, segments and graphs no manifest entry references any more.  The
+     * sweep is a directory scan, which is why it is not run on every flush. */
+    if (!s->readonly) {
+        sfb_store_reclaim_request(s);
+        (void)sfb_store_reclaim_auto(s, NULL);
+    }
+
     if (fresh != NULL)
         *fresh = is_fresh;
     return SFB_OK;
@@ -699,6 +856,14 @@ int sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
                             uint32_t records, uint32_t min_id, uint32_t max_id,
                             uint32_t *out_seq)
 {
+    return sfb_store_segment_write_ex(s, data, len, records, min_id, max_id, 0u,
+                                      out_seq);
+}
+
+int sfb_store_segment_write_ex(sfb_store_t *s, const void *data, size_t len,
+                               uint32_t records, uint32_t min_id, uint32_t max_id,
+                               uint16_t extra_flags, uint32_t *out_seq)
+{
     seg_hdr_t h;
     uint8_t hb[SFB_SEG_HDR_LEN];
     uint8_t *payload = NULL;
@@ -723,6 +888,10 @@ int sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
         return SFB_E_CAPACITY;           /* generation counter exhausted     */
     if (len > SIZE_MAX - SFB_SEG_HDR_LEN - SFB_TAG_LEN)
         return SFB_E_INVALID;
+    /* A caller may only ask for a payload encoding this build knows; SEALED is
+     * this file's business, not the caller's. */
+    if (extra_flags & (uint16_t)~(SFB_SEG_FLAGS_KNOWN & ~SFB_SEG_FLAG_SEALED))
+        return SFB_E_INVALID;
 
     /* A flush publishes: it opens a new generation and every segment and the
      * graph it writes carry that generation.  Callers rely on the bump
@@ -744,9 +913,12 @@ int sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
     h.max_id = max_id;
     /* W3.6: the writer says what it actually put in the payload.  s->quantize_int8
      * is the brain's vector encoding, so an int8 brain only ever writes int8
-     * segments; a legacy f32 store keeps writing flag-0 segments byte for byte. */
+     * segments; a legacy f32 store keeps writing flag-0 segments byte for byte.
+     * W3.5: extra_flags carries SFB_SEG_FLAG_RECCRC_FULL from the brain, whose
+     * record block then carries full-record CRCs. */
     if (s->quantize_int8)
         h.flags = (uint16_t)SFB_SEG_FLAG_INT8;
+    h.flags = (uint16_t)(h.flags | extra_flags);
 
     if (s->encrypted) {
 #ifdef SFB_NO_CRYPTO
@@ -832,6 +1004,7 @@ int sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
                                     ((size_t)s->man.nseg + 1) * sizeof *ns);
     if (ns == NULL) {
         rc = SFB_E_NOMEM;                /* sealed file stays as an orphan   */
+        sfb_store_reclaim_request(s);    /* ...which a sweep may collect     */
         goto out;
     }
     s->man.segs = ns;
@@ -854,6 +1027,7 @@ int sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
         s->man.nseg--;
         s->man.count -= records;
         s->man.total_bytes -= (uint64_t)file_len;
+        sfb_store_reclaim_request(s);
         goto out;
     }
     s->bytes_written += (uint64_t)file_len;
@@ -867,6 +1041,9 @@ out:
     return rc;
 }
 
+static int seg_read_impl(const sfb_store_t *s, const sfb_seg_entry_t *e,
+                         void **out, size_t *len, uint16_t *flags_out, int strict);
+
 int sfb_store_segment_read(const sfb_store_t *s, const sfb_seg_entry_t *e,
                            void **out, size_t *len)
 {
@@ -875,6 +1052,24 @@ int sfb_store_segment_read(const sfb_store_t *s, const sfb_seg_entry_t *e,
 
 int sfb_store_segment_read_ex(const sfb_store_t *s, const sfb_seg_entry_t *e,
                               void **out, size_t *len, uint16_t *flags_out)
+{
+    return seg_read_impl(s, e, out, len, flags_out, 1);
+}
+
+int sfb_store_segment_read_damaged(const sfb_store_t *s, const sfb_seg_entry_t *e,
+                                   void **out, size_t *len, uint16_t *flags_out)
+{
+    return seg_read_impl(s, e, out, len, flags_out, 0);
+}
+
+/* strict != 0 is the normal read: payload CRC and manifest digest must match.
+ * strict == 0 is the W3.5 isolation read: the segment must still be a complete,
+ * structurally intact segment (same length as the manifest entry, a header that
+ * decodes and agrees with it, a GCM tag that authenticates), but a payload CRC
+ * or digest mismatch is tolerated so the brain can attribute the damage to one
+ * record.  Everything that could mean "torn write" is checked in both modes. */
+static int seg_read_impl(const sfb_store_t *s, const sfb_seg_entry_t *e,
+                         void **out, size_t *len, uint16_t *flags_out, int strict)
 {
     uint8_t hb[SFB_SEG_HDR_LEN];
     seg_hdr_t h;
@@ -952,16 +1147,24 @@ int sfb_store_segment_read_ex(const sfb_store_t *s, const sfb_seg_entry_t *e,
         goto out;
     }
 
-    if (sfb_crc32c(pay, (size_t)h.payload_len) != h.payload_crc) {
-        rc = SFB_E_CORRUPT;
-        goto out;
+    if (strict) {
+        if (sfb_crc32c(pay, (size_t)h.payload_len) != h.payload_crc) {
+            rc = SFB_E_CORRUPT;
+            goto out;
+        }
+        fcrc = sfb_crc32c_update(sfb_crc32c(hb, SFB_SEG_HDR_LEN),
+                                 pay, (size_t)h.payload_len);
+        if (fcrc != e->digest) {
+            rc = SFB_E_CORRUPT;          /* manifest digest mismatch         */
+            goto out;
+        }
+        /* W3.3: how many segments had their payload CRC + whole-file digest
+         * actually checked.  The default open keeps this at 0. */
+        ((sfb_store_t *)s)->segments_verified++;
     }
-    fcrc = sfb_crc32c_update(sfb_crc32c(hb, SFB_SEG_HDR_LEN),
-                             pay, (size_t)h.payload_len);
-    if (fcrc != e->digest) {
-        rc = SFB_E_CORRUPT;              /* manifest digest mismatch         */
-        goto out;
-    }
+    /* W3.3: counts real payload reads, so a digest-lazy open can be told apart
+     * from a verifying one.  Diagnostic only — the store is otherwise const. */
+    ((sfb_store_t *)s)->segments_read++;
 
     if ((h.flags & SFB_SEG_FLAG_SEALED) != 0) {
 #ifdef SFB_NO_CRYPTO
@@ -1015,6 +1218,37 @@ out:
         (void)close(fd);
     free(pay);
     return rc;
+}
+
+/* W3.3: 48-byte header + length probe, no payload read. */
+/* Cheap structural check used by the default (digest-lazy) open path: does the
+ * newest segment still exist, is it a regular file, and is its size the one the
+ * manifest recorded?  A segment is only renamed into place after a complete,
+ * fsynced write, so ANY torn or short write shows up as a length mismatch — and
+ * that must fail the open (SFB_E_CORRUPT) instead of quietly importing a
+ * truncated brain.  Deliberately does not read or interpret the header: an
+ * unknown flag bit or a version this build cannot read is damage that replay
+ * reports and quarantines (segment-level), which is a different verdict from
+ * "the store is torn". */
+int sfb_store_segment_probe(const sfb_store_t *s, const sfb_seg_entry_t *e)
+{
+    char path[4096];
+    struct stat st;
+    int rc;
+
+    if (s == NULL || e == NULL)
+        return SFB_E_INVALID;
+    if (e->length < SFB_SEG_HDR_LEN)
+        return SFB_E_CORRUPT;
+
+    rc = seg_path(s, e->gen, e->seq, path, sizeof path, NULL);
+    if (rc != SFB_OK)
+        return rc;
+    if (stat(path, &st) != 0)
+        return (errno == ENOENT) ? SFB_E_NOTFOUND : st_errno(errno);
+    if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->length)
+        return SFB_E_CORRUPT;
+    return SFB_OK;
 }
 
 /* Structural + CRC verification with no allocation at all: safe to run over
@@ -1095,6 +1329,12 @@ int sfb_store_segment_verify(const sfb_store_t *s, const sfb_seg_entry_t *e)
         rc = SFB_E_CORRUPT;
         goto out;
     }
+    /* W3.3: this is the function that actually performs the payload-CRC +
+     * whole-file-digest work for the paranoid verify_full open and for
+     * sfb_verify(), so it — not only the strict reader's internal check — is
+     * where `segments_verified` has to move.  Without this the counter stayed
+     * at 0 after a verify_full open that verified every segment. */
+    ((sfb_store_t *)s)->segments_verified++;
     rc = SFB_OK;
 
 out:
@@ -1148,6 +1388,8 @@ int sfb_store_quarantine(sfb_store_t *s, const sfb_seg_entry_t *e)
 
     s->segments_quarantined++;
     s->records_dropped += e->records;
+    /* W3.4: the file just became unreferenced, so the next sweep collects it. */
+    sfb_store_reclaim_request(s);
     return SFB_OK;
 }
 
@@ -1157,32 +1399,62 @@ int sfb_store_quarantine(sfb_store_t *s, const sfb_seg_entry_t *e)
  *            (a younger gen may belong to a flush in progress).
  *   graph:   gen != man.graph_gen, AND gen < man.generation (the newest
  *            snapshot is kept even before graph_gen has been updated).
+ *   .tmp / .quarantine siblings of either: a manifest never references them, so
+ *            they are collected by an age/generation rule — a `.tmp` of the
+ *            current generation may be a write in flight, so only a strictly
+ *            older generation or a file older than SFB_STALE_TMP_SECS counts as
+ *            stale litter (W3.4).
+ *   The scan runs only when sfb_store_reclaim_request() asked for one.
  * ----------------------------------------------------------------────── */
-static int parse_seg_name(const char *name, uint32_t *gen, uint32_t *seq)
+#define SFB_STALE_TMP_SECS 300.0
+
+typedef enum {
+    SFB_NAME_BAD = 0,
+    SFB_NAME_FINAL,
+    SFB_NAME_TMP,
+    SFB_NAME_QUARANTINE
+} sfb_name_kind_t;
+
+static sfb_name_kind_t parse_seg_name(const char *name, uint32_t *gen, uint32_t *seq)
 {
     unsigned g = 0, q = 0;
     int consumed = -1;
+    const char *suffix;
+    sfb_name_kind_t kind = SFB_NAME_BAD;
 
     if (sscanf(name, "seg-%u-%u.qtsq%n", &g, &q, &consumed) != 2)
-        return 0;
-    if (consumed < 0 || (size_t)consumed != strlen(name))
-        return 0;
+        return SFB_NAME_BAD;
+    if (consumed < 0)
+        return SFB_NAME_BAD;
+    suffix = name + consumed;
+    if (*suffix == '\0')
+        kind = SFB_NAME_FINAL;
+    else if (strcmp(suffix, ".tmp") == 0)
+        kind = SFB_NAME_TMP;
+    else if (strcmp(suffix, ".quarantine") == 0)
+        kind = SFB_NAME_QUARANTINE;
+    else
+        return SFB_NAME_BAD;
     *gen = (uint32_t)g;
     *seq = (uint32_t)q;
-    return 1;
+    return kind;
 }
 
-static int parse_graph_name(const char *name, uint64_t *gen)
+static sfb_name_kind_t parse_graph_name(const char *name, uint64_t *gen)
 {
     unsigned long long g = 0;
     int consumed = -1;
+    const char *suffix;
 
     if (sscanf(name, "graph-%llu.bin%n", &g, &consumed) != 1)
-        return 0;
-    if (consumed < 0 || (size_t)consumed != strlen(name))
-        return 0;
+        return SFB_NAME_BAD;
+    if (consumed < 0)
+        return SFB_NAME_BAD;
+    suffix = name + consumed;
+    if (*suffix != '\0' && strcmp(suffix, ".tmp") != 0)
+        return SFB_NAME_BAD;
     *gen = (uint64_t)g;
-    return 1;
+    return *suffix == '\0' ? SFB_NAME_FINAL : SFB_NAME_TMP;
 }
 
 static int is_referenced(const sfb_store_t *s, uint32_t gen, uint32_t seq)
@@ -1196,12 +1468,23 @@ static int is_referenced(const sfb_store_t *s, uint32_t gen, uint32_t seq)
     return 0;
 }
 
+/* A stale write-in-progress leftover is anything older than this process can
+ * still have open: a strictly older generation, or an mtime this far in the
+ * past.  A live .tmp is never older than the write that created it. */
+static int is_stale_tmp(const struct stat *st, double now)
+{
+    double age = now - (double)st->st_mtime;
+
+    return age > SFB_STALE_TMP_SECS;
+}
+
 static int reclaim_dir(sfb_store_t *s, const char *dir, int graphs,
                        uint64_t *removed)
 {
     DIR *d;
     struct dirent *de;
     char path[4096];
+    double now = sfb_now_secs();
 
     d = opendir(dir);
     if (d == NULL)
@@ -1211,27 +1494,45 @@ static int reclaim_dir(sfb_store_t *s, const char *dir, int graphs,
         uint32_t g32 = 0, q32 = 0;
         uint64_t g64 = 0;
         struct stat st;
+        sfb_name_kind_t kind;
+        int newest_gen_only_if_stale = 0;
 
         if (!graphs) {
-            if (!parse_seg_name(de->d_name, &g32, &q32))
+            kind = parse_seg_name(de->d_name, &g32, &q32);
+            if (kind == SFB_NAME_BAD)
                 continue;
             if ((uint64_t)g32 > s->man.generation)
                 continue;                /* younger than the manifest: keep */
-            if (is_referenced(s, g32, q32))
-                continue;                /* live                             */
+            if (kind == SFB_NAME_FINAL) {
+                if (is_referenced(s, g32, q32))
+                    continue;            /* live                             */
+            } else if ((uint64_t)g32 >= s->man.generation) {
+                /* the newest generation's files are never deleted outright:
+                 * that .tmp / .quarantine may belong to the flush running now */
+                newest_gen_only_if_stale = 1;
+            }
         } else {
-            if (!parse_graph_name(de->d_name, &g64))
+            kind = parse_graph_name(de->d_name, &g64);
+            if (kind == SFB_NAME_BAD)
                 continue;
-            if (g64 >= s->man.generation)
-                continue;                /* newest snapshot: keep           */
-            if (g64 == s->man.graph_gen)
-                continue;                /* referenced by the manifest      */
+            if (g64 > s->man.generation)
+                continue;                /* younger than the manifest: keep */
+            if (kind == SFB_NAME_FINAL) {
+                if (g64 == s->man.generation)
+                    continue;            /* newest snapshot: keep           */
+                if (g64 == s->man.graph_gen)
+                    continue;            /* referenced by the manifest      */
+            } else if (g64 >= s->man.generation) {
+                newest_gen_only_if_stale = 1;
+            }
         }
 
         if (sfb_path_join(path, sizeof path, dir, de->d_name) != SFB_OK)
             continue;
         if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
             continue;                    /* never unlink a directory        */
+        if (newest_gen_only_if_stale && !is_stale_tmp(&st, now))
+            continue;
         if (unlink(path) == 0)
             (*removed)++;
     }
@@ -1267,6 +1568,35 @@ int sfb_store_reclaim(sfb_store_t *s, uint64_t *files_removed)
     if (files_removed != NULL)
         *files_removed = removed;
     return SFB_OK;
+}
+
+void sfb_store_reclaim_request(sfb_store_t *s)
+{
+    if (s != NULL)
+        s->reclaim_pending = 1;
+}
+
+/* Run the sweep only when something asked for one (W3.4).  A read-only handle
+ * never deletes anything: the request is simply dropped. */
+int sfb_store_reclaim_auto(sfb_store_t *s, uint64_t *files_removed)
+{
+    int rc;
+
+    if (s == NULL)
+        return SFB_E_INVALID;
+    if (files_removed != NULL)
+        *files_removed = 0;
+    if (!s->reclaim_pending)
+        return SFB_OK;
+    if (s->readonly) {
+        s->reclaim_pending = 0;
+        return SFB_OK;
+    }
+    s->reclaim_pending = 0;
+    rc = sfb_store_reclaim(s, files_removed);
+    if (rc != SFB_OK)
+        s->reclaim_pending = 1;          /* try again on the next publish   */
+    return rc;
 }
 
 uint64_t sfb_store_bytes_on_disk(const sfb_store_t *s)

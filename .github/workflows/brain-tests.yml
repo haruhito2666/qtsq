@@ -1,0 +1,102 @@
+name: brain-tests
+
+# The Sofuu Brain unit suite (make -C sofuu/brain test): 13 test binaries plus
+# the `sfb serve` loopback broker end-to-end, ~13k checks. Kept in its own
+# workflow/job rather than folded into brain-chaos so a red check names the
+# failing surface -- a unit-suite break and a chaos/durability break are
+# different bugs and must not look like the same check.
+on:
+  pull_request:
+    paths:
+      - 'sofuu/brain/**'
+      - 'include/qtsq.h'
+      - 'crypto/**'
+      - 'Makefile'
+      - '.github/workflows/brain-tests.yml'
+  push:
+    branches: [ master ]
+    paths:
+      - 'sofuu/brain/**'
+      - 'include/qtsq.h'
+      - 'crypto/**'
+      - 'Makefile'
+      - '.github/workflows/brain-tests.yml'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  brain-unit:
+    name: brain-unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # gobjc++: the ROOT Makefile compiles src/*.mm with -x objective-c++ on
+      # every platform, and gcc's Objective-C++ frontend (cc1objplus) is not
+      # part of build-essential.
+      # zlib1g-dev: libqtsq.a is linked with -lz, both by the module and by
+      # tests/test_serve.sh, which compiles its own socket client.
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gobjc++ zlib1g-dev
+
+      # The root Makefile pins `CC = cc` (a makefile assignment overrides the
+      # environment), so a clang fallback only reaches it as a command-line
+      # assignment -- MAKE_CC_ARG is empty on the normal gcc path.
+      - name: Toolchain check (Objective-C++ frontend)
+        run: |
+          echo "uname -s -> $(uname -s)"
+          cc --version | head -1
+          echo 'int main(void){return 0;}' > "$RUNNER_TEMP/probe.mm"
+          if cc -x objective-c++ -c "$RUNNER_TEMP/probe.mm" -o "$RUNNER_TEMP/probe.o" 2>/dev/null; then
+            echo "cc can compile Objective-C++ (src/qtsq_metal.mm is an empty TU off Darwin: #ifdef __APPLE__)"
+            echo "MAKE_CC_ARG=" >> "$GITHUB_ENV"
+          else
+            echo "::warning::cc has no Objective-C++ frontend; building with clang instead"
+            echo "MAKE_CC_ARG=CC=clang" >> "$GITHUB_ENV"
+          fi
+
+      # See the Linux note in brain-chaos.yml (the module cross-compiles clean
+      # for x86_64-linux-gnu; the flock()/<sys/file.h> trap is already fixed).
+      - name: Build root library (libqtsq.a)
+        run: make lib ${MAKE_CC_ARG}
+
+      # The target builds every tests/test_* binary, tests/chaos_worker, ./sfb,
+      # runs each suite, then runs tests/test_serve.sh; any failure exits 1.
+      - name: Run brain unit suite
+        working-directory: sofuu/brain
+        run: |
+          set -o pipefail
+          make test ${MAKE_CC_ARG} 2>&1 | tee "${RUNNER_TEMP:-/tmp}/brain-test.log"
+          grep -E '^=== ALL SFB UNIT TESTS PASSED ===$' "${RUNNER_TEMP:-/tmp}/brain-test.log"
+
+  # The module is developed on macOS and ships there too; the suite must hold
+  # on both. This lane needs no setup step (clang + SDK + python3 are on the
+  # runner image).
+  brain-unit-macos:
+    name: brain-unit-macos-14
+    # Skipped on the nightly cron: the same suite already runs on
+    # ubuntu there, and a macOS lane costs 10x the minutes.
+    if: github.event_name != 'schedule'
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build root library (libqtsq.a)
+        run: make lib
+
+      - name: Run brain unit suite
+        working-directory: sofuu/brain
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee "${RUNNER_TEMP:-/tmp}/brain-test.log"
+          grep -E '^=== ALL SFB UNIT TESTS PASSED ===$' "${RUNNER_TEMP:-/tmp}/brain-test.log"

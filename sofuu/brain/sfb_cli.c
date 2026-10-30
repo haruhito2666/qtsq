@@ -33,6 +33,15 @@
 #include <sys/un.h>
 #include <time.h>
 
+/* sfb.h is frozen, so the report-returning entry points sfb_ops.c exposes for
+ * machine-readable output are declared here. Each one runs the same code path
+ * as its ABI sibling (sfb_migrate / sfb_backup) and hands the JSON report back
+ * instead of printing it — which is exactly what --json needs. */
+int sfb_ops_backup_report(const char *path, const char *dest,
+                          char *json_out, size_t cap);
+int sfb_ops_migrate_report(const char *src_path, const char *dst_path,
+                           const char *key, char *json_out, size_t cap);
+
 #define CLI_EXIT_OK     0
 #define CLI_EXIT_ERROR  1
 #define CLI_EXIT_USAGE  2
@@ -60,10 +69,11 @@ static void cli_usage(FILE *out, const char *argv0)
         "commands:\n"
         "  verify  <brain> [--json] [--repair]   digest + CRC scrub, optional repair\n"
         "  repair  <brain> [--json]              quarantine damaged segments\n"
-        "  backup  <brain> <dest>                hardlink snapshot of a sealed store\n"
+        "  backup  <brain> <dest> [--json]       hardlink snapshot, reports link/copy\n"
         "  restore <backup> <dest>               recreate a store from a snapshot\n"
-        "  stats   <brain> [--json]              open read-only, print stats\n"
-        "  migrate <src> <dst>                   v1 single-file brain -> v2 store\n"
+        "  stats   <brain> [--json]              open read-only, print honest stats\n"
+        "  migrate <src> <dst> [--json] [--key <pass>]\n"
+        "                                        v1 single-file brain -> v2 store\n"
         "  selftest                              run built-in smoke checks\n"
         "  serve   <brain-dir> [--socket <path>] [--dim <n>] [--key <pass>]\n"
         "                                        share the brain over a UNIX socket\n"
@@ -161,6 +171,91 @@ static void cli_jarray(const char *j, const char *key, const char *indent)
     if (!any) fprintf(stdout, "%s(none)\n", indent);
 }
 
+/* Extract one JSON string value (report paths and reason codes). Returns 1 when
+ * the key was present and a string. */
+static int cli_jstr(const char *j, const char *key, char *out, size_t cap)
+{
+    const char *p = cli_jfind(j, key);
+    size_t n = 0;
+
+    if (out && cap) out[0] = '\0';
+    if (!p) return 0;
+    while (*p == ' ') p++;
+    if (*p != '"') return 0;
+    p++;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            char e = *p++;
+            switch (e) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case '"': c = '"';  break;
+            case '\\': c = '\\'; break;
+            case 'u': {
+                char hex[5] = {0};
+                for (int i = 0; i < 4 && *p; i++) hex[i] = *p++;
+                long cp = strtol(hex, NULL, 16);
+                c = (cp > 0 && cp < 128) ? (char)cp : '?';
+                break;
+            }
+            default: c = e; break;
+            }
+        }
+        if (out && n + 1 < cap) out[n++] = c;
+    }
+    if (out && cap) out[n] = '\0';
+    return 1;
+}
+
+/* Is this value JSON null? Used for the fields a cold process cannot know
+ * (W7.4: the per-process flush counters), which must never be printed as 0. */
+static int cli_jnull(const char *j, const char *key)
+{
+    const char *p = cli_jfind(j, key);
+    if (!p) return 0;
+    while (*p == ' ') p++;
+    return strncmp(p, "null", 4) == 0;
+}
+
+/* Print an array of {generation,segments,records,bytes} objects — the stats
+ * generation history. Each object is bounded and parsed with the same
+ * extractors as every other field (no JSON library on this module's list). */
+static void cli_jgen_history(const char *j, const char *key, const char *indent)
+{
+    const char *p = cli_jfind(j, key);
+    int any = 0;
+
+    if (!p) return;
+    while (*p == ' ') p++;
+    if (*p != '[') return;
+    p++;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']' || *p != '{') break;
+        const char *end = strchr(p, '}');
+        char obj[256];
+        size_t len;
+        unsigned long long gen = 0, segs = 0, recs = 0, bytes = 0;
+
+        if (!end) break;
+        len = (size_t)(end - p) + 1;
+        if (len >= sizeof obj) len = sizeof obj - 1;
+        memcpy(obj, p, len);
+        obj[len] = '\0';
+        (void)cli_ju64(obj, "generation", &gen);
+        (void)cli_ju64(obj, "segments", &segs);
+        (void)cli_ju64(obj, "records", &recs);
+        (void)cli_ju64(obj, "bytes", &bytes);
+        fprintf(stdout, "%sgen %-6llu: %llu segment(s), %llu record(s), %llu byte(s)\n",
+                indent, gen, segs, recs, bytes);
+        any = 1;
+        p = end + 1;
+    }
+    if (!any) fprintf(stdout, "%s(none)\n", indent);
+}
+
 /* ── verify / repair ───────────────────────────────────────────────────── */
 static int cli_verify(const char *path, int want_json, int repair)
 {
@@ -216,7 +311,7 @@ static int cli_verify(const char *path, int want_json, int repair)
 /* ── stats ─────────────────────────────────────────────────────────────── */
 static int cli_stats(const char *path, int want_json)
 {
-    char json[8192];
+    char json[65536];
     memset(json, 0, sizeof json);
     int rc = sfb_stats_json(path, NULL, json, sizeof json);
     if (!json[0]) {
@@ -231,23 +326,143 @@ static int cli_stats(const char *path, int want_json)
     }
     int ok = 0;
     (void)cli_jbool(json, "ok", &ok);
-    if (!ok) {
-        cli_jarray(json, "errors", "  ");
-        cli_error("stats", rc != SFB_OK ? rc : SFB_E_STATE);
-        return CLI_EXIT_ERROR;
-    }
     static const char *keys[] = {
         "dim", "records", "live", "tombstones", "segments", "generations",
-        "bytes_records", "bytes_on_disk", "records_dropped",
+        "bytes_records", "bytes_on_disk", "records_sealed", "records_dropped",
+        "damaged_segments", "segments_missing", "quarantine_files",
         "segments_quarantined", "ids_renumbered", "index_rebuilt",
-        "flushes", "flush_last_us", "open_us", "events"
+        "open_us", "events"
     };
     printf("stats %s\n", path);
+    printf("  %-21s : %s\n", "ok", ok ? "true" : "false");
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         unsigned long long v = 0;
-        if (cli_ju64(json, keys[i], &v)) printf("  %-22s: %llu\n", keys[i], v);
+        if (cli_ju64(json, keys[i], &v)) printf("  %-21s : %llu\n", keys[i], v);
+    }
+    /* W7.4(c): a per-process counter a cold process cannot know is printed as
+     * unknown, never as a zero that looks like a measurement. */
+    static const char *cold[] = { "flushes", "flush_last_us" };
+    for (size_t i = 0; i < sizeof cold / sizeof cold[0]; i++) {
+        unsigned long long v = 0;
+        if (cli_jnull(json, cold[i]))
+            printf("  %-21s : (unknown: per-process counter)\n", cold[i]);
+        else if (cli_ju64(json, cold[i], &v))
+            printf("  %-21s : %llu\n", cold[i], v);
+    }
+    printf("  %-21s :\n", "generation history");
+    cli_jgen_history(json, "generation_history", "    ");
+    if (!ok) {
+        printf("  %-21s :\n", "missing files");
+        cli_jarray(json, "missing_files", "    ");
+        printf("  %-21s :\n", "findings");
+        cli_jarray(json, "errors", "    ");
+        cli_error("stats", rc != SFB_OK ? rc : SFB_E_CORRUPT);
+        return CLI_EXIT_ERROR;
     }
     if (rc != SFB_OK) { cli_error("stats", rc); return CLI_EXIT_ERROR; }
+    return CLI_EXIT_OK;
+}
+
+/* ── backup: say what kind of snapshot you got (W7.3) ──────────────────── */
+static int cli_backup(const char *src, const char *dest, int want_json)
+{
+    char json[16384];
+    memset(json, 0, sizeof json);
+    int rc = sfb_ops_backup_report(src, dest, json, sizeof json);
+    if (!json[0]) {
+        cli_error("backup", rc);
+        return CLI_EXIT_ERROR;
+    }
+    if (want_json) {
+        printf("%s\n", json);
+        fflush(stdout);
+        if (rc != SFB_OK) { cli_error("backup", rc); return CLI_EXIT_ERROR; }
+        return CLI_EXIT_OK;
+    }
+    if (rc != SFB_OK) {
+        fprintf(stderr, "%s\n", json);
+        cli_error("backup", rc);
+        return CLI_EXIT_ERROR;
+    }
+
+    unsigned long long files = 0, linked = 0, copied = 0;
+    unsigned long long bytes_linked = 0, bytes_copied = 0;
+    char snapshot[32] = {0}, reason[64] = {0};
+    (void)cli_ju64(json, "files", &files);
+    (void)cli_ju64(json, "files_linked", &linked);
+    (void)cli_ju64(json, "files_copied", &copied);
+    (void)cli_ju64(json, "bytes_linked", &bytes_linked);
+    (void)cli_ju64(json, "bytes_copied", &bytes_copied);
+    (void)cli_jstr(json, "snapshot", snapshot, sizeof snapshot);
+    (void)cli_jstr(json, "copy_reason", reason, sizeof reason);
+
+    printf("backup: %s -> %s\n", src, dest);
+    printf("  %-21s : %llu\n", "files backed up", files);
+    printf("  %-21s : %llu (%llu byte(s))\n", "hardlinked", linked, bytes_linked);
+    printf("  %-21s : %llu (%llu byte(s))\n", "byte-copied", copied, bytes_copied);
+    /* the manifest is always a byte copy: it is the snapshot's commit point */
+    printf("  %-21s : byte copy, written last\n", "manifest");
+    if (copied > 0) {
+        printf("  %-21s : %s (%llu of %llu file(s) fell back to a copy%s%s)\n",
+               "snapshot", snapshot[0] ? snapshot : "mixed", copied, files,
+               reason[0] ? ", reason: " : "", reason);
+    } else {
+        printf("  %-21s : %s (instant, no payload bytes copied)\n",
+               "snapshot", snapshot[0] ? snapshot : "hardlink");
+    }
+    return CLI_EXIT_OK;
+}
+
+/* ── migrate: a real import or a v2 no-op, and say which (W7.5) ────────── */
+static int cli_migrate(const char *src, const char *dest, const char *key,
+                       int want_json)
+{
+    char json[8192];
+    memset(json, 0, sizeof json);
+    int rc = sfb_ops_migrate_report(src, dest, key, json, sizeof json);
+    if (!json[0]) {
+        cli_error("migrate", rc);
+        return CLI_EXIT_ERROR;
+    }
+    if (want_json) {
+        printf("%s\n", json);
+        fflush(stdout);
+        if (rc != SFB_OK) { cli_error("migrate", rc); return CLI_EXIT_ERROR; }
+        return CLI_EXIT_OK;
+    }
+    if (rc != SFB_OK) {
+        /* keep the machine-readable reason on stderr, like sfb_migrate itself */
+        fprintf(stderr, "%s\n", json);
+        cli_error("migrate", rc);
+        return CLI_EXIT_ERROR;
+    }
+
+    char action[32] = {0};
+    (void)cli_jstr(json, "action", action, sizeof action);
+    if (strcmp(action, "imported") == 0) {
+        unsigned long long records = 0, rejected = 0;
+        char backup[4096] = {0};
+        (void)cli_ju64(json, "records", &records);
+        (void)cli_ju64(json, "rejected", &rejected);
+        (void)cli_jstr(json, "backup", backup, sizeof backup);
+        printf("migrate: %s -> %s (imported %llu record(s) from the v1 brain",
+               src, dest, records);
+        if (rejected > 0) printf(", %llu row(s) rejected", rejected);
+        printf(")\n");
+        if (backup[0]) printf("  %-21s : %s\n", "v1 backup", backup);
+        return CLI_EXIT_OK;
+    }
+    if (strcmp(action, "noop") == 0) {
+        printf("migrate: %s -> %s (already v2, nothing re-encoded)\n", src, dest);
+        return CLI_EXIT_OK;
+    }
+    if (strcmp(action, "copied") == 0) {
+        printf("migrate: %s -> %s (already v2, copied verbatim; nothing re-encoded)\n",
+               src, dest);
+        return CLI_EXIT_OK;
+    }
+    /* an action this build does not know: print the report, invent nothing */
+    printf("%s\n", json);
     return CLI_EXIT_OK;
 }
 
@@ -745,32 +960,75 @@ int main(int argc, char **argv)
         return cli_stats(path, want_json);
     }
 
-    if (!strcmp(cmd, "backup") || !strcmp(cmd, "restore") || !strcmp(cmd, "migrate")) {
-        if (argc != 4) {
-            fprintf(stderr, "sfb %s: expected <src> <dest>\n", cmd);
+    if (!strcmp(cmd, "backup")) {
+        const char *a = NULL, *d = NULL;
+        int want_json = 0;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--json")) want_json = 1;
+            else if (cli_is_flag(argv[i])) {
+                fprintf(stderr, "sfb backup: unknown option %s\n", argv[i]);
+                cli_usage(stderr, argv[0]);
+                return CLI_EXIT_USAGE;
+            } else if (!a) a = argv[i];
+            else if (!d) d = argv[i];
+            else {
+                fprintf(stderr, "sfb backup: unexpected argument %s\n", argv[i]);
+                return CLI_EXIT_USAGE;
+            }
+        }
+        if (!a || !d) {
+            fprintf(stderr, "sfb backup: expected <brain> <dest>\n");
             cli_usage(stderr, argv[0]);
             return CLI_EXIT_USAGE;
         }
-        const char *a = argv[2], *d = argv[3];
-        int rc;
-        if (!strcmp(cmd, "backup")) {
-            rc = sfb_backup(a, d);
-            if (rc == SFB_OK) { printf("backup: %s -> %s\n", a, d); return CLI_EXIT_OK; }
-            cli_error("backup", rc);
-            return CLI_EXIT_ERROR;
+        return cli_backup(a, d, want_json);
+    }
+
+    if (!strcmp(cmd, "restore")) {
+        if (argc != 4) {
+            fprintf(stderr, "sfb restore: expected <backup> <dest>\n");
+            cli_usage(stderr, argv[0]);
+            return CLI_EXIT_USAGE;
         }
-        if (!strcmp(cmd, "restore")) {
-            rc = sfb_restore(a, d);
-            if (rc == SFB_OK) { printf("restore: %s -> %s\n", a, d); return CLI_EXIT_OK; }
-            cli_error("restore", rc);
-            return CLI_EXIT_ERROR;
+        int rc = sfb_restore(argv[2], argv[3]);
+        if (rc == SFB_OK) {
+            printf("restore: %s -> %s\n", argv[2], argv[3]);
+            return CLI_EXIT_OK;
         }
-        rc = sfb_migrate(a, d, NULL);
-        if (rc == SFB_OK) { printf("migrate: %s -> %s (already v2, nothing re-encoded)\n", a, d); return CLI_EXIT_OK; }
-        /* sfb_migrate already wrote its JSON reason to stderr (frozen ABI has no
-         * report parameter) — we add the typed error name here. */
-        cli_error("migrate", rc);
+        cli_error("restore", rc);
         return CLI_EXIT_ERROR;
+    }
+
+    if (!strcmp(cmd, "migrate")) {
+        const char *a = NULL, *d = NULL, *key = NULL;
+        int want_json = 0;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--json")) {
+                want_json = 1;
+            } else if (!strcmp(argv[i], "--key")) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "sfb migrate: --key needs a passphrase\n");
+                    cli_usage(stderr, argv[0]);
+                    return CLI_EXIT_USAGE;
+                }
+                key = argv[++i];
+            } else if (cli_is_flag(argv[i])) {
+                fprintf(stderr, "sfb migrate: unknown option %s\n", argv[i]);
+                cli_usage(stderr, argv[0]);
+                return CLI_EXIT_USAGE;
+            } else if (!a) a = argv[i];
+            else if (!d) d = argv[i];
+            else {
+                fprintf(stderr, "sfb migrate: unexpected argument %s\n", argv[i]);
+                return CLI_EXIT_USAGE;
+            }
+        }
+        if (!a || !d) {
+            fprintf(stderr, "sfb migrate: expected <src> <dst>\n");
+            cli_usage(stderr, argv[0]);
+            return CLI_EXIT_USAGE;
+        }
+        return cli_migrate(a, d, key, want_json);
     }
 
     fprintf(stderr, "sfb: unknown command '%s'\n", cmd);

@@ -29,7 +29,8 @@ LIB = libsfb.a
 BIN = sfb
 
 TESTS = test_util test_crypto test_store test_hnsw test_lock test_text_quant \
-        test_brain test_ops test_keys test_migrate test_dims test_gates test_int8
+        test_brain test_ops test_keys test_migrate test_dims test_gates test_int8 \
+        test_w2_safety test_w7 test_w3_storage test_w5_semantics
 TESTBINS = $(addprefix tests/,$(TESTS))
 
 all: $(LIB) $(BIN)

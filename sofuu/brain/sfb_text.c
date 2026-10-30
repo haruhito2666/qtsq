@@ -149,17 +149,20 @@ double sfb_text_jaccard(const char *a, const char *b)
  *
  *   score = Σ_q  idf(q) · tf·(k1+1) / (tf + k1·(1 - b + b·dl/avg_len))
  *
- * Simplification, deliberate and local to this helper: the collection is
- * treated as N = 1 document, so for any query term that occurs in `doc`
- * df == N == 1 and
+ * This entry point is the SINGLE-DOCUMENT form, deliberately: it is handed one
+ * document and nothing else, so it treats the collection as N = 1 and for any
+ * query term that occurs in `doc` df == N == 1, giving the constant
  *
  *   idf = ln(1 + (N - df + 0.5)/(df + 0.5)) = ln(1 + 0.5/1.5) = ln(4/3)
  *
- * i.e. a positive constant. A real N/df pair belongs to whoever owns the
- * corpus (sfb_brain.c); this helper only needs a monotone, finite, positive
- * weight so that per-document ranking is well defined. Terms absent from
- * `doc` contribute nothing (tf == 0), so the idf branch for df == 0 is never
- * reached and the score can never be negative.
+ * A ranking over a corpus must NOT use this: a constant idf scores a term that
+ * appears in every document exactly like one that appears in one, so the
+ * lexical list could not tell a rare term from a stopword (W4.6).  The
+ * corpus-aware form is sfb_text_stats_begin/add + sfb_text_bm25_stats below,
+ * which computes real document frequencies.  This helper stays because it has
+ * no corpus by contract and existing callers/tests use it as a monotone
+ * per-document weight.  Terms absent from `doc` contribute nothing (tf == 0),
+ * so the score can never be negative.
  * ---------------------------------------------------------------------- */
 double sfb_text_bm25(const char *query, const char *doc, double avg_len,
                      double k1, double b)
@@ -194,5 +197,99 @@ double sfb_text_bm25(const char *query, const char *doc, double avg_len,
     }
 
     if (!isfinite(score) || score < 0.0) return 0.0;
+    return score;
+}
+
+/* ── BM25 with real corpus statistics (W4.6) ─────────────────────────────
+ * The contract is in sfb_internal.h.  The corpus owner (sfb_brain.c) walks its
+ * live rows once to accumulate df and the average length, then once more to
+ * score.  Two passes, no allocation, exact df — the honest version of the
+ * constant-idf shortcut above.
+ *
+ * df is the standard document frequency: the number of live documents that
+ * contain the term at least once, the document being scored included.  idf is
+ * the BM25+ style ln(1 + (N - df + 0.5)/(df + 0.5)), which is positive for
+ * every df <= N and therefore cannot invert a match into a penalty.
+ * ---------------------------------------------------------------------- */
+#if SFB_TEXT_STATS_SLOTS != SFB_TOK_SLOTS
+#error "sfb_internal.h and sfb_text.c disagree about the token-table geometry"
+#endif
+
+void sfb_text_stats_begin(sfb_text_stats_t *st, const char *query)
+{
+    sfb_tokmap_t mq;
+    uint32_t i;
+
+    if (st == NULL)
+        return;
+    memset(st, 0, sizeof *st);
+    sfb_tokmap_build(&mq, query, NULL);
+    for (i = 0; i < SFB_TOK_SLOTS; i++) {
+        if (!mq.cnt[i])
+            continue;
+        st->key[i] = mq.key[i];
+        st->in_query[i] = 1u;
+        st->nterms++;
+    }
+}
+
+void sfb_text_stats_add(sfb_text_stats_t *st, const char *doc)
+{
+    sfb_tokmap_t md;
+    uint32_t dl = 0, i;
+
+    if (st == NULL)
+        return;
+    sfb_tokmap_build(&md, doc, &dl);
+    st->n_docs++;
+    st->total_len += (double)dl;
+    for (i = 0; i < SFB_TEXT_STATS_SLOTS; i++)
+        if (st->in_query[i] && sfb_tokmap_find(&md, st->key[i]) != 0u)
+            st->df[i]++;
+}
+
+double sfb_text_bm25_stats(const sfb_text_stats_t *st, const char *doc,
+                           double k1, double b)
+{
+    sfb_tokmap_t md;
+    uint32_t dl_tok = 0, i;
+    double n, avg, norm, score = 0.0;
+
+    if (st == NULL || st->n_docs == 0 || st->nterms == 0)
+        return 0.0;
+    sfb_tokmap_build(&md, doc, &dl_tok);
+    if (md.n == 0)
+        return 0.0;
+
+    n = (double)st->n_docs;
+    avg = st->total_len > 0.0 ? st->total_len / n : (double)dl_tok;
+    if (!isfinite(avg) || avg < 1.0)
+        avg = dl_tok > 0 ? (double)dl_tok : 1.0;
+    if (!isfinite(k1) || k1 < 0.0) k1 = 1.2;
+    if (!isfinite(b)) b = 0.75;
+    if (b < 0.0) b = 0.0;
+    if (b > 1.0) b = 1.0;
+
+    norm = k1 * (1.0 - b + b * ((double)dl_tok / avg));
+
+    for (i = 0; i < SFB_TEXT_STATS_SLOTS; i++) {
+        uint32_t j, df;
+        double idf, tf;
+
+        if (!st->in_query[i])
+            continue;
+        j = sfb_tokmap_find(&md, st->key[i]);
+        if (!j)
+            continue;                       /* tf == 0 ⇒ no contribution    */
+        df = st->df[i];
+        if (df == 0u)
+            continue;                       /* cannot happen with tf > 0    */
+        idf = log(1.0 + (n - (double)df + 0.5) / ((double)df + 0.5));
+        tf = (double)md.cnt[j - 1u];
+        score += idf * (tf * (k1 + 1.0)) / (tf + norm);
+    }
+
+    if (!isfinite(score) || score < 0.0)
+        return 0.0;
     return score;
 }

@@ -1,9 +1,30 @@
 /*
- * sfb_lock.c — Sofuu Brain v2: flock-based ownership (W2.1 / W2.2 / W2.3 helper).
+ * sfb_lock.c — Sofuu Brain v2: flock-based ownership (W2.1 / W2.2 / W2.3).
  *
  * One lock file per brain (<store>/brain.qtsq.lock). Writers take LOCK_EX,
  * readers LOCK_SH, both non-blocking: a busy lock is reported as SFB_E_LOCKED
  * rather than parking the caller.
+ *
+ * W2.3 — a reader never writes to the store directory. sfb_lock_acquire() with
+ * shared=1 opens the lock file O_RDONLY and never O_CREATs, truncates or writes
+ * it; it does not even create the file when it is absent. What a reader locks:
+ *
+ *   lock file exists  → flock(LOCK_SH) on it. A live writer holds LOCK_EX on
+ *                       that very file, so the reader is excluded from a writer
+ *                       and vice versa, exactly as before.
+ *   lock file absent  → no writer can be inside (a writer creates the file
+ *                       before it takes the lock), so there is nothing to be
+ *                       excluded *from*. The reader still must not let a writer
+ *                       start under it, so it takes flock(LOCK_SH) on the store
+ *                       *directory* instead; sfb_lock_acquire(shared=0) probes
+ *                       that same directory LOCK_EX (and drops the probe as soon
+ *                       as the lock file — the authoritative gate — is held).
+ *                       Neither flock() creates a file or moves a timestamp.
+ *
+ * A reader therefore leaves no pid record behind, and sfb_lock_holder() on a
+ * store that only readers have touched reports SFB_E_NOTFOUND. That record was
+ * already documented as "evidence, not ownership" by its only consumer
+ * (sfb_ops.c), and the kernel's flock is unchanged.
  *
  * Stale reclaim is flock-driven, never time-driven. If the previous holder
  * died, the kernel has already dropped its flock, so the next owner's own
@@ -42,6 +63,19 @@
 #endif
 
 #define SFB_LOCK_RECORD_MAX 512
+
+/* The lock fd must not survive an exec in a spawned child, or the child would
+ * keep the brain locked after the real owner has exited. */
+#if defined(O_CLOEXEC)
+#define SFB_LOCK_CLOEXEC O_CLOEXEC
+#else
+#define SFB_LOCK_CLOEXEC 0
+#endif
+
+/* A reader re-checks that the lock file it flocked is still the file at `path`
+ * (a writer may unlink it between our open() and our flock()). Churn that
+ * outlives this many rounds is reported rather than spun on forever. */
+#define SFB_LOCK_READER_TRIES 8
 
 /* ── small local helpers (this file links without sfb_util.c) ───────────── */
 
@@ -142,11 +176,183 @@ static int lock_owns_file(int fd, const char *path, pid_t pid)
 
 /* ── acquire ───────────────────────────────────────────────────────────── */
 
+/* Directory part of the lock path, "." when it has none. No libgen (it can
+ * modify its argument and is not thread-safe in the classic form). */
+static int lock_dir_of(const char *path, char *out, size_t cap)
+{
+    size_t n = strlen(path);
+
+    while (n > 0 && path[n - 1] != '/') n--;      /* drop the last component */
+    if (n == 0) {                                 /* "brain.qtsq.lock"       */
+        if (cap < 2) return SFB_E_INVALID;
+        out[0] = '.';
+        out[1] = '\0';
+        return SFB_OK;
+    }
+    while (n > 1 && path[n - 1] == '/') n--;      /* "/a/b" -> "/a", "/b" -> "/" */
+    if (n >= cap) return SFB_E_INVALID;
+    memcpy(out, path, n);
+    out[n] = '\0';
+    return SFB_OK;
+}
+
+/* Open the store directory itself (read-only, nothing is created). */
+static int lock_open_dir(const char *path)
+{
+    char        dir[4096];
+    struct stat st;
+    int         fd;
+
+    if (lock_dir_of(path, dir, sizeof dir) != SFB_OK) return -1;
+    fd = open(dir, O_RDONLY | SFB_LOCK_CLOEXEC);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        (void)close(fd);
+        errno = ENOTDIR;
+        return -1;
+    }
+    return fd;
+}
+
+static int lock_path_exists(const char *path)
+{
+    struct stat st;
+
+    return stat(path, &st) == 0 || errno != ENOENT;
+}
+
+/* Does `path` still name the inode behind `fd`? */
+static int lock_same_file(int fd, const char *path)
+{
+    struct stat fst, pst;
+
+    if (fstat(fd, &fst) != 0) return 0;
+    if (stat(path, &pst) != 0) return 0;
+    return fst.st_dev == pst.st_dev && fst.st_ino == pst.st_ino;
+}
+
+/*
+ * Reader acquisition (W2.3): shared flock only, on a file that already exists.
+ * Nothing is created, truncated or written, and no record is left behind.
+ */
+static int lock_acquire_shared(sfb_lock_t *l)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < SFB_LOCK_READER_TRIES; attempt++) {
+        int fd = open(l->path, O_RDONLY | SFB_LOCK_CLOEXEC);
+
+        if (fd >= 0) {
+            if (flock(fd, LOCK_SH | LOCK_NB) != 0) {
+                int err = errno;
+
+                (void)close(fd);
+                return (err == EWOULDBLOCK || err == EAGAIN) ? SFB_E_LOCKED
+                                                             : SFB_E_IO;
+            }
+            /* A writer between our open() and our flock() may have unlinked the
+             * file (it removes it on clean release); the flock we just took is
+             * then on an orphaned inode and excludes nobody. Retry on the path. */
+            if (lock_same_file(fd, l->path)) {
+                l->fd = fd;
+                return SFB_OK;
+            }
+            (void)flock(fd, LOCK_UN);
+            (void)close(fd);
+            continue;
+        }
+
+        if (errno != ENOENT) return SFB_E_IO;
+
+        /*
+         * No lock file: no writer is inside, because a writer creates the file
+         * before it takes the lock. We must not create it, so the store
+         * directory itself carries the shared lock; a writer's LOCK_EX probe on
+         * that directory (lock_acquire_exclusive) is what keeps a writer out
+         * while we read.
+         */
+        {
+            int dfd = lock_open_dir(l->path);
+
+            if (dfd < 0) return SFB_E_IO;      /* no directory: nothing to read */
+            if (flock(dfd, LOCK_SH | LOCK_NB) != 0) {
+                int err = errno;
+
+                (void)close(dfd);
+                if (err == EWOULDBLOCK || err == EAGAIN) return SFB_E_LOCKED;
+                /* Directory locking unsupported here (e.g. some network
+                 * filesystems): read unlocked rather than refuse every open. */
+                return SFB_OK;
+            }
+            /* A writer may have created + locked the file while we were taking
+             * the directory lock. If so, its file lock is the one to respect. */
+            if (lock_path_exists(l->path)) {
+                (void)flock(dfd, LOCK_UN);
+                (void)close(dfd);
+                continue;
+            }
+            l->fd = dfd;
+            return SFB_OK;
+        }
+    }
+    return SFB_E_IO;                           /* constant churn: report it */
+}
+
+/*
+ * Writer acquisition: unchanged W2.1/W2.2 semantics (O_CREAT|O_RDWR + LOCK_EX,
+ * record written by sfb_lock_acquire below). The only addition is the
+ * directory probe: it fails *before* the lock file is created, so a writer that
+ * loses to a reader which holds the directory (see lock_acquire_shared) leaves
+ * no file behind. The probe is non-blocking and dropped as soon as the lock
+ * file's flock — the authoritative gate for writers — is held.
+ */
+static int lock_acquire_exclusive(sfb_lock_t *l, int no_lock)
+{
+    int dirfd = -1;
+    int fd;
+
+    if (!no_lock) {
+        dirfd = lock_open_dir(l->path);
+        if (dirfd >= 0 && flock(dirfd, LOCK_EX | LOCK_NB) != 0) {
+            int err = errno;
+
+            (void)close(dirfd);
+            if (err == EWOULDBLOCK || err == EAGAIN) return SFB_E_LOCKED;
+            dirfd = -1;                /* dir locks unsupported: file flock rules */
+        }
+    }
+
+    fd = open(l->path, O_CREAT | O_RDWR | SFB_LOCK_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (dirfd >= 0) (void)close(dirfd);
+        return SFB_E_IO;
+    }
+
+    if (!no_lock) {
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            int err = errno;
+
+            (void)close(fd);
+            if (dirfd >= 0) (void)close(dirfd);
+            return (err == EWOULDBLOCK || err == EAGAIN) ? SFB_E_LOCKED
+                                                         : SFB_E_IO;
+        }
+        /*
+         * Reaching here means we hold the lock. If the file carries a dead
+         * holder's record, the kernel already released that flock and we just
+         * took it: truncating below is the whole reclaim path.
+         */
+    }
+    if (dirfd >= 0) (void)close(dirfd);       /* probe done: the file is ours */
+
+    l->fd = fd;
+    return SFB_OK;
+}
+
 int sfb_lock_acquire(sfb_lock_t *l, const char *path, int shared, int no_lock)
 {
     char        started[64];
     char        record[SFB_LOCK_RECORD_MAX];
-    int         fd;
     int         rc;
     size_t      plen;
     const char *mode;
@@ -162,32 +368,17 @@ int sfb_lock_acquire(sfb_lock_t *l, const char *path, int shared, int no_lock)
     l->shared = shared ? 1 : 0;
     memcpy(l->path, path, plen + 1);
 
-    /* O_CLOEXEC: a lock fd must not survive an exec in a spawned child, or the
-     * child would keep the brain locked after the real owner has exited. */
-    fd = open(path, O_CREAT | O_RDWR
-#if defined(O_CLOEXEC)
-              | O_CLOEXEC
-#endif
-              , 0600);
-    if (fd < 0) return SFB_E_IO;
-
-    if (!no_lock) {
-        int op = (l->shared ? LOCK_SH : LOCK_EX) | LOCK_NB;
-
-        if (flock(fd, op) != 0) {
-            int err = errno;
-            (void)close(fd);
-            return (err == EWOULDBLOCK || err == EAGAIN) ? SFB_E_LOCKED : SFB_E_IO;
-        }
-        /*
-         * Reaching here means we hold the lock. If the file carries a dead
-         * holder's record, the kernel already released that flock and we just
-         * took it: truncating below is the whole reclaim path.
-         */
+    if (l->shared) {
+        /* W2.3: a read-only open never writes to the store directory — it does
+         * not even create the lock file. Nothing to record, nothing to unlink. */
+        return no_lock ? SFB_OK : lock_acquire_shared(l);
     }
 
-    l->fd  = fd;
-    mode   = l->shared ? "reader" : "writer";
+    rc = lock_acquire_exclusive(l, no_lock);
+    if (rc != SFB_OK) return rc;
+
+    /* Writer record, byte-for-byte as it has always been (W2.1/W2.2). */
+    mode = "writer";
     lock_iso8601_now(started, sizeof started);
 
     rc = snprintf(record, sizeof record, "pid %ld\nstarted %s\nmode %s\n",
@@ -197,11 +388,11 @@ int sfb_lock_acquire(sfb_lock_t *l, const char *path, int shared, int no_lock)
         return SFB_E_INVALID;
     }
 
-    if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
+    if (ftruncate(l->fd, 0) != 0 || lseek(l->fd, 0, SEEK_SET) < 0) {
         (void)sfb_lock_release(l);
         return SFB_E_IO;
     }
-    rc = lock_write_all(fd, record, (size_t)rc);
+    rc = lock_write_all(l->fd, record, (size_t)rc);
     if (rc != SFB_OK) {
         (void)sfb_lock_release(l);
         return rc;
@@ -218,8 +409,10 @@ int sfb_lock_release(sfb_lock_t *l)
 
     if (l == NULL || l->fd < 0) return SFB_OK;
 
-    /* Writers remove the file so a clean release leaves no metadata behind;
-     * readers never do (they must not disturb a concurrent writer's record). */
+    /* Writers remove the file so a clean release leaves no metadata behind.
+     * Readers never do, and never wrote one: their fd is either the shared
+     * lock file (left exactly as found) or, when no lock file existed, the
+     * store directory they locked shared — closing it releases the flock. */
     if (!l->shared && lock_owns_file(l->fd, l->path, l->pid)) {
         if (unlink(l->path) != 0 && errno != ENOENT) rc = SFB_E_IO;
     }

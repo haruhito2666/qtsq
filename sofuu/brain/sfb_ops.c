@@ -70,9 +70,39 @@
  *      re-imported (no record importer is exposed). Every drop is reported.
  *
  *  A8. sfb_migrate has no report parameter in the frozen ABI, so the honest
- *      machine-readable refusal is written to stderr as one JSON object. Callers
- *      that want it programmatically should redirect fd 2 (tests/test_ops.c
- *      does exactly that).
+ *      machine-readable report is written to stderr as one JSON object. Callers
+ *      that want it programmatically can redirect fd 2 (tests/test_ops.c does
+ *      exactly that) or call sfb_ops_migrate_report() below, which runs the very
+ *      same code path and hands the JSON back without printing it.
+ *
+ *  A9. sfb_backup has no report parameter either. The link-vs-copy accounting
+ *      (W7.3) is exposed the same way, through sfb_ops_backup_report(); both
+ *      report entry points are declared by their callers (sfb_cli.c,
+ *      tests/test_w7.c) because sfb.h is frozen and must not grow.
+ *
+ * A10. Stats honesty (W7.4). `sfb stats` must never say ok:true about a store
+ *      that verify calls damaged, so sfb_stats_json() runs ops_health_scan() —
+ *      verify's own detection for everything that can be decided without
+ *      decrypting or walking records:
+ *        • every manifest entry must have its segment file (matched by
+ *          sfb_store.c's name first, then by exact byte length, so detection
+ *          never depends on the file name);
+ *        • the file's size must equal entry->length;
+ *        • verify's ops_seg_header_broken() must accept the 48-byte header and
+ *          its CRC32C over the payload as stored (catches any payload flip);
+ *        • the manifest digest must match one of verify's accepted bases.
+ *      Per-record CRC walking, decryption and quarantining stay verify-only.
+ *      Cost: one stat per manifest entry plus one sequential read per segment
+ *      file — cheaper than the sfb_open() stats already performs.
+ *      Two consequences the operator sees:
+ *        • history (W7.4b) is derived from man.segs[] grouped by generation
+ *          (generation, segment count, records, bytes), newest 64 rows with
+ *          generation_history_total/…_truncated so it is never silently cut;
+ *        • latency (W7.4c) is honest: open_us is measured by this process and
+ *          labelled open_us_source, while flushes/flush_last_us are per-process
+ *          counters a cold process never touched, so they are JSON null with a
+ *          latency_note instead of a 0 that reads like a measurement.
+ *      A missing graph snapshot for man.graph_gen also counts against ok.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -84,6 +114,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include <limits.h>
+/* flock()/LOCK_SH/LOCK_NB: Darwin declares them through <fcntl.h>, glibc only
+ * through <sys/file.h>. Relying on the Darwin transitive declaration made this
+ * file fail to compile on Linux ("call to undeclared function 'flock'"). */
+#include <sys/file.h>
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -314,15 +348,99 @@ static int ops_copy_file(const char *src, const char *dst)
     return rc;
 }
 
-/* Hardlink, then fall back to a byte copy (W7.3). */
-static int ops_link_or_copy(const char *src, const char *dst, int *used_link)
+/* ── hardlink vs byte-copy accounting (W7.3) ─────────────────────────────
+ * A backup prefers link(): an instant snapshot that copies no payload bytes.
+ * When the filesystem refuses (a different device is the common case) the byte
+ * copy is still a correct fallback, but the caller is entitled to know which
+ * one it got — on a large store that is the difference between milliseconds
+ * and a full read+write. This accounting never changes the outcome; it only
+ * stops hiding it. */
+typedef struct {
+    uint64_t files;            /* payload files stored (segments + graph)     */
+    uint64_t linked;
+    uint64_t copied;
+    uint64_t bytes_linked;
+    uint64_t bytes_copied;
+    uint64_t link_failures;
+    uint64_t reason_exdev;     /* files whose link() failed cross-device      */
+    uint64_t reason_emlink;    /* … too many links                            */
+    uint64_t reason_eperm;     /* … permission / protected path               */
+    uint64_t reason_enosys;    /* … hardlinks unsupported by this filesystem  */
+    uint64_t reason_other;     /* … anything else                             */
+    int      first_errno;      /* errno of the first failing link(), 0 = none */
+    uint64_t manifest_copied;  /* 1: the manifest is always a byte copy       */
+} ops_links_t;
+
+/* Stable identifiers for the report; the raw errno stays out of the JSON. */
+static const char *ops_link_reason_name(int e)
 {
-    if (used_link) *used_link = 0;
+    if (e == 0) return "none";
+#ifdef EXDEV
+    if (e == EXDEV) return "cross_device_link";
+#endif
+#ifdef EMLINK
+    if (e == EMLINK) return "too_many_links";
+#endif
+#ifdef EPERM
+    if (e == EPERM) return "permission_denied";
+#endif
+#ifdef EACCES
+    if (e == EACCES) return "permission_denied";
+#endif
+#ifdef ENOSYS
+    if (e == ENOSYS) return "hardlinks_not_supported";
+#endif
+#ifdef EOPNOTSUPP
+    if (e == EOPNOTSUPP) return "hardlinks_not_supported";
+#endif
+#if defined(ENOTSUP) && (!defined(EOPNOTSUPP) || ENOTSUP != EOPNOTSUPP)
+    if (e == ENOTSUP) return "hardlinks_not_supported";
+#endif
+    return "link_failed";
+}
+
+static void ops_links_note_failure(ops_links_t *ls, int e)
+{
+    if (!ls) return;
+    ls->link_failures++;
+    if (ls->first_errno == 0) ls->first_errno = e;
+#ifdef EXDEV
+    if (e == EXDEV) { ls->reason_exdev++; return; }
+#endif
+#ifdef EMLINK
+    if (e == EMLINK) { ls->reason_emlink++; return; }
+#endif
+#ifdef EPERM
+    if (e == EPERM) { ls->reason_eperm++; return; }
+#endif
+#ifdef EACCES
+    if (e == EACCES) { ls->reason_eperm++; return; }
+#endif
+#ifdef ENOSYS
+    if (e == ENOSYS) { ls->reason_enosys++; return; }
+#endif
+#ifdef EOPNOTSUPP
+    if (e == EOPNOTSUPP) { ls->reason_enosys++; return; }
+#endif
+#if defined(ENOTSUP) && (!defined(EOPNOTSUPP) || ENOTSUP != EOPNOTSUPP)
+    if (e == ENOTSUP) { ls->reason_enosys++; return; }
+#endif
+    ls->reason_other++;
+}
+
+/* Hardlink, then fall back to a byte copy (W7.3). `size` is the source length,
+ * counted so the report can say how much was shared instead of copied. */
+static int ops_link_or_copy(const char *src, const char *dst, uint64_t size,
+                            ops_links_t *ls)
+{
     if (link(src, dst) == 0) {
-        if (used_link) *used_link = 1;
+        if (ls) { ls->linked++; ls->bytes_linked += size; }
         return SFB_OK;
     }
-    return ops_copy_file(src, dst);
+    ops_links_note_failure(ls, errno);
+    int rc = ops_copy_file(src, dst);
+    if (rc == SFB_OK && ls) { ls->copied++; ls->bytes_copied += size; }
+    return rc;
 }
 
 /* ── digest bases accepted for a segment file (assumption A3) ──────────── */
@@ -1292,9 +1410,11 @@ static void ops_lock_probe_end(ops_lockprobe_t *p)
 
 /* ── shared copy of a whole store (backup, migrate v2 no-op) ───────────── */
 /* Copies <src_dir> → <dst_dir>: sealed segments and the graph first, the
- * manifest last, so <dst_dir> is never observable in a half state (W7.3). */
+ * manifest last, so <dst_dir> is never observable in a half state (W7.3).
+ * When `links` is not NULL it is filled with what actually happened per file
+ * (hardlink vs byte copy), which is what the backup report is made of. */
 static int ops_copy_store(const char *src_path, const char *dst_path,
-                          int check_writer_lock)
+                          int check_writer_lock, ops_links_t *links)
 {
     if (!src_path || !src_path[0] || !dst_path || !dst_path[0]) return SFB_E_INVALID;
 
@@ -1354,11 +1474,10 @@ static int ops_copy_store(const char *src_path, const char *dst_path,
         char sp[4096], dp[4096];
         if (sfb_path_join(sp, sizeof sp, src.seg_dir, files.v[i].name) != 0) continue;
         if (sfb_path_join(dp, sizeof dp, dst_seg, files.v[i].name) != 0) continue;
-        int used_link = 0;
-        rc = ops_link_or_copy(sp, dp, &used_link);
+        rc = ops_link_or_copy(sp, dp, files.v[i].size, links);
         if (rc != SFB_OK) goto out;
         files_copied++;
-        (void)used_link;
+        if (links) links->files++;
     }
 
     /* HNSW snapshots are part of the store (W7.3 says "the graph file"), so
@@ -1375,11 +1494,10 @@ static int ops_copy_store(const char *src_path, const char *dst_path,
                     continue;
                 if (sfb_path_join(dp, sizeof dp, dst_seg, graphs.v[i].name) != 0)
                     continue;
-                int used_link = 0;
-                rc = ops_link_or_copy(sp, dp, &used_link);
+                rc = ops_link_or_copy(sp, dp, graphs.v[i].size, links);
                 if (rc != SFB_OK) { ops_files_free(&graphs); goto out; }
                 copied_graphs++;
-                (void)used_link;
+                if (links) links->files++;
             }
         }
         ops_files_free(&graphs);
@@ -1402,8 +1520,11 @@ static int ops_copy_store(const char *src_path, const char *dst_path,
         if (sfb_path_join(dman, sizeof dman, dst_path, SFB_MANIFEST_NAME) != 0) {
             rc = SFB_E_INVALID; goto out;
         }
+        /* The manifest is deliberately a byte copy, never a link: the snapshot
+         * must not share the mutable consistency point with the live store. */
         rc = ops_copy_file(src.manifest_path, dman);
         if (rc != SFB_OK) goto out;
+        if (links) links->manifest_copied = 1;
     }
     (void)sfb_fsync_dir(dst_seg);
     (void)sfb_fsync_dir(dst_path);
@@ -1447,9 +1568,91 @@ out:
     return rc;
 }
 
+/* ── backup report (W7.3) ────────────────────────────────────────────────
+ * sfb_backup() has no report parameter in the frozen ABI, so the link/copy
+ * accounting is exposed through this non-ABI entry point (see A9). It runs the
+ * very same copy path, so sfb_backup() and the report cannot disagree. */
+static void ops_backup_json(ops_sb_t *sb, const char *src, const char *dest,
+                            const ops_links_t *ls, int rc)
+{
+    static const struct { const char *name; int which; } reasons[] = {
+        { "cross_device_link",       0 },
+        { "too_many_links",          1 },
+        { "permission_denied",       2 },
+        { "hardlinks_not_supported", 3 },
+        { "link_failed",             4 }
+    };
+    uint64_t n[5];
+    int first = 1;
+
+    ops_sb_puts(sb, "{\"ok\":");
+    ops_sb_puts(sb, rc == SFB_OK ? "true" : "false");
+    ops_sb_puts(sb, ",\"action\":\"backup\",\"src\":");
+    ops_json_str(sb, src);
+    ops_sb_puts(sb, ",\"dest\":");
+    ops_json_str(sb, dest);
+    if (rc != SFB_OK) {
+        ops_sb_printf(sb, ",\"code\":%d", rc);
+        ops_sb_puts(sb, ",\"error\":");
+        ops_json_str(sb, sfb_strerror(rc));
+    }
+    ops_sb_printf(sb, ",\"files\":%llu", (unsigned long long)ls->files);
+    ops_sb_printf(sb, ",\"files_linked\":%llu", (unsigned long long)ls->linked);
+    ops_sb_printf(sb, ",\"files_copied\":%llu", (unsigned long long)ls->copied);
+    ops_sb_printf(sb, ",\"bytes_linked\":%llu", (unsigned long long)ls->bytes_linked);
+    ops_sb_printf(sb, ",\"bytes_copied\":%llu", (unsigned long long)ls->bytes_copied);
+    ops_sb_puts(sb, ",\"manifest_copied\":");
+    ops_sb_puts(sb, ls->manifest_copied ? "true" : "false");
+    ops_sb_puts(sb, ",\"snapshot\":");
+    if (ls->copied == 0)
+        ops_json_str(sb, ls->linked ? "hardlink" : "empty");
+    else if (ls->linked == 0)
+        ops_json_str(sb, "copy");
+    else
+        ops_json_str(sb, "mixed");
+    ops_sb_puts(sb, ",\"link_fallback\":");
+    ops_sb_puts(sb, ls->copied ? "true" : "false");
+    ops_sb_puts(sb, ",\"copy_reason\":");
+    if (ls->copied) ops_json_str(sb, ops_link_reason_name(ls->first_errno));
+    else ops_sb_puts(sb, "null");
+    ops_sb_printf(sb, ",\"link_failures\":%llu", (unsigned long long)ls->link_failures);
+
+    n[0] = ls->reason_exdev;
+    n[1] = ls->reason_emlink;
+    n[2] = ls->reason_eperm;
+    n[3] = ls->reason_enosys;
+    n[4] = ls->reason_other;
+    ops_sb_puts(sb, ",\"copy_reasons\":[");
+    for (size_t i = 0; i < sizeof reasons / sizeof reasons[0]; i++) {
+        if (n[reasons[i].which] == 0) continue;
+        if (!first) ops_sb_puts(sb, ",");
+        first = 0;
+        ops_sb_puts(sb, "{\"reason\":");
+        ops_json_str(sb, reasons[i].name);
+        ops_sb_printf(sb, ",\"count\":%llu}", (unsigned long long)n[reasons[i].which]);
+    }
+    ops_sb_puts(sb, "]}");
+}
+
+int sfb_ops_backup_report(const char *path, const char *dest,
+                          char *json_out, size_t json_cap)
+{
+    ops_sb_t sb;
+    ops_links_t links;
+    int rc;
+
+    memset(&links, 0, sizeof links);
+    ops_sb_init(&sb);
+    rc = ops_copy_store(path, dest, 1 /* refuse while a writer holds it */, &links);
+    ops_backup_json(&sb, path, dest, &links, rc);
+    ops_json_flush(&sb, json_out, json_cap);
+    ops_sb_free(&sb);
+    return rc;
+}
+
 int sfb_backup(const char *path, const char *dest)
 {
-    return ops_copy_store(path, dest, 1 /* refuse while a writer holds it */);
+    return ops_copy_store(path, dest, 1 /* refuse while a writer holds it */, NULL);
 }
 
 /* ── restore: inverse of backup, never overwriting ─────────────────────── */
@@ -1524,20 +1727,340 @@ int sfb_restore(const char *backup_path, const char *dest)
 static int ops_probe_dim(const char *path, uint32_t *dim)
 {
     sfb_store_t st;
+    int rc;
+
+    memset(&st, 0, sizeof st);
     if (ops_fill_paths(&st, path) != SFB_OK) return SFB_E_INVALID;
     if (!ops_is_file(st.manifest_path)) return SFB_E_NOTFOUND;
-    int rc = sfb_store_manifest_load(&st);
+    rc = sfb_store_manifest_load(&st);
     if (rc != SFB_OK) return (rc == SFB_E_CORRUPT) ? SFB_E_CORRUPT : rc;
-    if (st.man.magic != SFB_MAGIC_MANIFEST) return SFB_E_CORRUPT;
-    if (st.man.dim < SFB_MIN_DIM || st.man.dim > SFB_MAX_DIM) return SFB_E_CORRUPT;
+    if (st.man.magic != SFB_MAGIC_MANIFEST || st.man.dim < SFB_MIN_DIM ||
+        st.man.dim > SFB_MAX_DIM) {
+        free(st.man.segs);          /* manifest_load hands ownership over */
+        return SFB_E_CORRUPT;
+    }
     *dim = st.man.dim;
+    free(st.man.segs);
+    return SFB_OK;
+}
+
+/* ── stats: generation history (W7.4b) ───────────────────────────────────
+ * A scalar "generations" cannot answer "what did the last flushes publish?".
+ * The manifest's segment table can: every sealed segment carries the generation
+ * its flush opened, so grouping the table by e->gen gives the real history —
+ * segment count, sealed record count and bytes per generation — with no
+ * invented counter. A generation whose segments were reclaimed is no longer in
+ * the manifest and so is absent here; generation_history_total reports how many
+ * distinct generations the table actually references.
+ *
+ * The report is bounded (the newest OPS_GEN_ROWS generations are kept) so a
+ * store with thousands of flushes cannot blow up the JSON buffer. */
+#define OPS_GEN_ROWS 64
+
+typedef struct {
+    uint64_t generation;
+    uint64_t segments;
+    uint64_t records;
+    uint64_t bytes;
+} ops_gen_row_t;
+
+typedef struct {
+    ops_gen_row_t row[OPS_GEN_ROWS];
+    int      n;             /* rows kept, ascending by generation            */
+    uint64_t total;         /* distinct generations referenced by the table  */
+    int      truncated;     /* total > n                                     */
+} ops_gen_hist_t;
+
+typedef struct {
+    uint32_t gen;
+    uint32_t records;
+    uint64_t length;
+} ops_gen_seed_t;
+
+static int ops_gen_seed_cmp(const void *a, const void *b)
+{
+    const ops_gen_seed_t *x = (const ops_gen_seed_t *)a;
+    const ops_gen_seed_t *y = (const ops_gen_seed_t *)b;
+
+    if (x->gen < y->gen) return -1;
+    if (x->gen > y->gen) return 1;
+    return 0;
+}
+
+static int ops_gen_hist_build(const sfb_manifest_t *m, ops_gen_hist_t *h)
+{
+    ops_gen_seed_t *seed;
+    uint32_t i = 0;
+
+    memset(h, 0, sizeof *h);
+    if (m->nseg == 0) return SFB_OK;
+
+    seed = (ops_gen_seed_t *)malloc((size_t)m->nseg * sizeof *seed);
+    if (seed == NULL) return SFB_E_NOMEM;
+    for (i = 0; i < m->nseg; i++) {
+        seed[i].gen = m->segs[i].gen;
+        seed[i].records = m->segs[i].records;
+        seed[i].length = m->segs[i].length;
+    }
+    qsort(seed, m->nseg, sizeof *seed, ops_gen_seed_cmp);
+
+    i = 0;
+    while (i < m->nseg) {
+        ops_gen_row_t g;
+
+        memset(&g, 0, sizeof g);
+        g.generation = seed[i].gen;
+        while (i < m->nseg && seed[i].gen == g.generation) {
+            g.segments++;
+            g.records += seed[i].records;
+            g.bytes += seed[i].length;
+            i++;
+        }
+        if (h->n < OPS_GEN_ROWS) {
+            h->row[h->n++] = g;
+        } else {
+            memmove(&h->row[0], &h->row[1], (OPS_GEN_ROWS - 1) * sizeof h->row[0]);
+            h->row[OPS_GEN_ROWS - 1] = g;
+            h->truncated = 1;
+        }
+        h->total++;
+    }
+    free(seed);
+    return SFB_OK;
+}
+
+/* ── stats: store-health scan (W7.4a) ────────────────────────────────────
+ * Verify's detection, restricted to what needs neither the key nor a walk over
+ * every record (assumption A10). It exists so `sfb stats` cannot say ok:true
+ * about a store whose manifest references a missing or damaged segment. */
+typedef struct {
+    int        ok;
+    int        manifest_ok;
+    int        graph_ok;
+    int        hard_errors;
+    uint64_t   segments;          /* manifest entries                      */
+    uint64_t   segments_missing;
+    uint64_t   segments_damaged;
+    uint64_t   records_sealed;    /* sum of the manifest's record counts   */
+    uint64_t   records_missing;
+    uint64_t   records_damaged;
+    uint64_t   quarantine_files;  /* .torn / .quarantine evidence on disk  */
+    ops_list_t missing;
+    ops_list_t errors;
+} ops_health_t;
+
+/* sfb_store.c names a segment seg-<gen>-<seq>.qtsq; that name is the fast
+ * lookup, and an exact byte-length match is the name-independent fallback, so
+ * detection never depends on sfb_store.c's naming staying the same. */
+static int ops_entry_file(const ops_files_t *files, int *claimed,
+                          const sfb_seg_entry_t *e)
+{
+    char want[96];
+
+    snprintf(want, sizeof want, "seg-%06u-%06u.qtsq",
+             (unsigned)e->gen, (unsigned)e->seq);
+    for (size_t i = 0; i < files->n; i++)
+        if (!claimed[i] && strcmp(files->v[i].name, want) == 0) return (int)i;
+    for (size_t i = 0; i < files->n; i++)
+        if (!claimed[i] && files->v[i].size == e->length) return (int)i;
+    return -1;
+}
+
+static int ops_health_scan(const char *path, ops_health_t *h,
+                           ops_gen_hist_t *hist)
+{
+    sfb_store_t st;
+    ops_files_t files;
+    int *claimed = NULL;
+    int *entry_file = NULL;
+    uint64_t sealed = 0, graph_files = 0;
+    int rc;
+
+    memset(h, 0, sizeof *h);
+    memset(hist, 0, sizeof *hist);
+    memset(&st, 0, sizeof st);
+    h->graph_ok = 1;
+
+    if (ops_fill_paths(&st, path) != SFB_OK) return SFB_E_INVALID;
+    st.readonly = 1;
+    if (!ops_is_file(st.manifest_path)) {
+        h->manifest_ok = 0;
+        ops_list_add(&h->errors, "manifest_missing: %s", st.manifest_path);
+        return SFB_E_CORRUPT;
+    }
+    rc = sfb_store_manifest_load(&st);
+    if (rc != SFB_OK || st.man.magic != SFB_MAGIC_MANIFEST) {
+        h->manifest_ok = 0;
+        ops_list_add(&h->errors, "manifest_unreadable (crc or magic): SFB error %d",
+                     rc);
+        free(st.man.segs);
+        return SFB_E_CORRUPT;
+    }
+    h->manifest_ok = 1;
+    h->segments = st.man.nseg;
+
+    for (uint32_t i = 0; i < st.man.nseg; i++) sealed += st.man.segs[i].records;
+    h->records_sealed = sealed;
+    if (st.man.count > sealed) {
+        /* same invariant verify enforces (assumption A6) */
+        h->hard_errors++;
+        ops_list_add(&h->errors,
+                     "count_exceeds_segment_records: manifest count %llu > sealed %llu",
+                     (unsigned long long)st.man.count, (unsigned long long)sealed);
+    }
+    rc = ops_gen_hist_build(&st.man, hist);
+    if (rc != SFB_OK) {
+        free(st.man.segs);
+        return rc;
+    }
+
+    memset(&files, 0, sizeof files);
+    rc = ops_scan_dir(&files, st.seg_dir, &graph_files);
+    if (rc == SFB_E_NOTFOUND) {
+        rc = SFB_OK;               /* an empty manifest needs no segment dir  */
+        if (st.man.nseg > 0)
+            ops_list_add(&h->errors, "segment_directory_missing: %s", st.seg_dir);
+    } else if (rc != SFB_OK) {
+        ops_list_add(&h->errors, "segment_directory_unreadable: SFB error %d", rc);
+        free(st.man.segs);
+        return rc;
+    }
+
+    if (files.n > 0) {
+        claimed = (int *)calloc(files.n, sizeof *claimed);
+        if (claimed == NULL) {
+            ops_files_free(&files);
+            free(st.man.segs);
+            return SFB_E_NOMEM;
+        }
+    }
+    entry_file = (int *)malloc((st.man.nseg ? st.man.nseg : 1) * sizeof *entry_file);
+    if (entry_file == NULL) {
+        free(claimed);
+        ops_files_free(&files);
+        free(st.man.segs);
+        return SFB_E_NOMEM;
+    }
+    for (uint32_t ei = 0; ei < st.man.nseg; ei++) entry_file[ei] = -1;
+
+    for (uint32_t ei = 0; ei < st.man.nseg; ei++) {
+        int fi = ops_entry_file(&files, claimed, &st.man.segs[ei]);
+        if (fi >= 0) {
+            claimed[fi] = 1;
+            entry_file[ei] = fi;
+        }
+    }
+
+    for (uint32_t ei = 0; ei < st.man.nseg; ei++) {
+        const sfb_seg_entry_t *e = &st.man.segs[ei];
+
+        if (entry_file[ei] < 0) {
+            h->segments_missing++;
+            h->hard_errors++;
+            h->records_missing += e->records;
+            ops_list_add(&h->missing, "segment gen=%u seq=%u (%u records)",
+                         e->gen, e->seq, e->records);
+            ops_list_add(&h->errors,
+                         "segment_file_missing: gen %u seq %u (%u records)",
+                         e->gen, e->seq, e->records);
+            continue;
+        }
+
+        const ops_segfile_t *f = &files.v[entry_file[ei]];
+        char full[4096];
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        int r, bad = 0;
+
+        if (sfb_path_join(full, sizeof full, st.seg_dir, f->name) != 0) continue;
+        r = ops_read_file(full, &buf, &len);
+        if (r != SFB_OK) {
+            h->segments_damaged++;
+            h->hard_errors++;
+            h->records_damaged += e->records;
+            ops_list_add(&h->errors, "segment_unreadable: %s (SFB error %d)",
+                         f->name, r);
+            continue;
+        }
+
+        if ((uint64_t)len != e->length) {
+            ops_list_add(&h->errors,
+                         "segment_size_mismatch: %s (manifest %llu, file %llu bytes)",
+                         f->name, (unsigned long long)e->length,
+                         (unsigned long long)len);
+            bad = 1;
+        } else {
+            char why[192] = {0};
+            if (ops_seg_header_broken(buf, len, e, st.man.dim, why, sizeof why)) {
+                ops_list_add(&h->errors, "segment_header_corrupt: %s (%s)",
+                             f->name, why);
+                bad = 1;
+            }
+        }
+        if (!bad) {
+            /* the manifest digest over verify's accepted bases: the whole-file
+             * CRC32C is the one sfb_store.c writes, so it is tried first and
+             * the tolerant set only on a miss */
+            uint32_t crc = sfb_crc32c(buf, len);
+            int hit = (crc == e->digest);
+
+            if (!hit) {
+                uint32_t bases[OPS_NBASES];
+                ops_digest_bases(buf, len, e->length, bases);
+                for (int k = 0; k < OPS_NBASES; k++)
+                    if (bases[k] == e->digest) { hit = 1; break; }
+            }
+            if (!hit) {
+                ops_list_add(&h->errors,
+                             "segment_digest_mismatch: %s (manifest %u, file %u, "
+                             "%llu bytes)",
+                             f->name, e->digest, crc, (unsigned long long)len);
+                bad = 1;
+            }
+        }
+        if (bad) {
+            h->segments_damaged++;
+            h->hard_errors++;
+            h->records_damaged += e->records;
+        }
+        free(buf);
+    }
+    free(entry_file);
+    free(claimed);
+    ops_files_free(&files);
+
+    if (st.man.graph_gen != 0) {
+        char why[128] = {0};
+        if (!ops_graph_present(st.seg_dir, st.man.graph_gen, why, sizeof why)) {
+            h->graph_ok = 0;
+            h->hard_errors++;
+            ops_list_add(&h->missing, "%s", why);
+            ops_list_add(&h->errors, "graph_file_missing: gen %llu "
+                                     "(rebuildable by reopen, not by a scrub)",
+                         (unsigned long long)st.man.graph_gen);
+        }
+    }
+    if (ops_is_dir(st.seg_dir)) {
+        uint64_t torn = 0, quar = 0;
+        ops_count_evidence(st.seg_dir, &torn, &quar);
+        h->quarantine_files = torn + quar;
+    }
+
+    h->ok = h->manifest_ok && h->hard_errors == 0 &&
+            h->segments_missing == 0 && h->segments_damaged == 0 && h->graph_ok;
+    free(st.man.segs);
     return SFB_OK;
 }
 
 static void ops_stats_json_emit(ops_sb_t *sb, const char *path, const uint32_t dim,
-                                const sfb_stats_t *st)
+                                const sfb_stats_t *st, const ops_health_t *h,
+                                const ops_gen_hist_t *hist, int ok)
 {
-    ops_sb_puts(sb, "{\"ok\":true,\"path\":");
+    uint64_t lost = h->records_missing + h->records_damaged;
+
+    ops_sb_puts(sb, "{\"ok\":");
+    ops_sb_puts(sb, ok ? "true" : "false");
+    ops_sb_puts(sb, ",\"path\":");
     ops_json_str(sb, path);
     ops_sb_printf(sb, ",\"dim\":%u", dim);
     ops_sb_printf(sb, ",\"format_version\":%d", SFB_FORMAT_VERSION);
@@ -1548,15 +2071,65 @@ static void ops_stats_json_emit(ops_sb_t *sb, const char *path, const uint32_t d
     ops_sb_printf(sb, ",\"generations\":%llu", (unsigned long long)st->generations);
     ops_sb_printf(sb, ",\"bytes_records\":%llu", (unsigned long long)st->bytes_records);
     ops_sb_printf(sb, ",\"bytes_on_disk\":%llu", (unsigned long long)st->bytes_on_disk);
-    ops_sb_printf(sb, ",\"records_dropped\":%llu", (unsigned long long)st->records_dropped);
+    /* W7.4(a): the recovery channel. This is what the on-disk detection found
+     * lost, not a per-process counter a cold `sfb stats` can never see. */
+    ops_sb_printf(sb, ",\"records_dropped\":%llu", (unsigned long long)lost);
     ops_sb_printf(sb, ",\"segments_quarantined\":%llu",
                   (unsigned long long)st->segments_quarantined);
     ops_sb_printf(sb, ",\"ids_renumbered\":%llu", (unsigned long long)st->ids_renumbered);
     ops_sb_printf(sb, ",\"index_rebuilt\":%llu", (unsigned long long)st->index_rebuilt);
-    ops_sb_printf(sb, ",\"flushes\":%llu", (unsigned long long)st->flushes);
-    ops_sb_printf(sb, ",\"flush_last_us\":%llu", (unsigned long long)st->flush_last_us);
+    /* W7.4(c): latency honesty. flushes/flush_last_us are per-process counters
+     * and this process has never flushed, so a 0 would mean "never measured"
+     * while looking like a measurement: they are null. open_us is the latency
+     * this process really measured around sfb_open(). */
+    ops_sb_puts(sb, ",\"flushes\":null");
+    ops_sb_puts(sb, ",\"flush_last_us\":null");
     ops_sb_printf(sb, ",\"open_us\":%llu", (unsigned long long)st->open_us);
     ops_sb_printf(sb, ",\"events\":%llu", (unsigned long long)st->events);
+    ops_sb_puts(sb, ",\"open_us_source\":\"measured_this_process\"");
+    ops_sb_puts(sb, ",\"latency_note\":\"open_us was measured by this process; "
+                    "flushes and flush_last_us are per-process counters that a "
+                    "cold stats process cannot know, so they are null\"");
+    /* verify's vocabulary, so stats and verify can be compared field by field */
+    ops_sb_printf(sb, ",\"records_dropped_estimate\":%llu", (unsigned long long)lost);
+    ops_sb_printf(sb, ",\"records_sealed\":%llu",
+                  (unsigned long long)h->records_sealed);
+    ops_sb_printf(sb, ",\"damaged_segments\":%llu",
+                  (unsigned long long)h->segments_damaged);
+    ops_sb_printf(sb, ",\"segments_missing\":%llu",
+                  (unsigned long long)h->segments_missing);
+    ops_sb_puts(sb, ",\"manifest_ok\":");
+    ops_sb_puts(sb, h->manifest_ok ? "true" : "false");
+    ops_sb_puts(sb, ",\"graph_ok\":");
+    ops_sb_puts(sb, h->graph_ok ? "true" : "false");
+    ops_sb_printf(sb, ",\"quarantine_files\":%llu",
+                  (unsigned long long)h->quarantine_files);
+    ops_sb_puts(sb, ",\"missing_files\":[");
+    for (int i = 0; i < h->missing.n; i++) {
+        if (i) ops_sb_puts(sb, ",");
+        ops_json_str(sb, h->missing.msg[i]);
+    }
+    ops_sb_puts(sb, "],\"errors\":[");
+    for (int i = 0; i < h->errors.n; i++) {
+        if (i) ops_sb_puts(sb, ",");
+        ops_json_str(sb, h->errors.msg[i]);
+    }
+    ops_sb_puts(sb, "]");
+    /* W7.4(b): the real generation history (manifest segment table) */
+    ops_sb_puts(sb, ",\"generation_history\":[");
+    for (int i = 0; i < hist->n; i++) {
+        if (i) ops_sb_puts(sb, ",");
+        ops_sb_printf(sb, "{\"generation\":%llu,\"segments\":%llu,"
+                          "\"records\":%llu,\"bytes\":%llu}",
+                      (unsigned long long)hist->row[i].generation,
+                      (unsigned long long)hist->row[i].segments,
+                      (unsigned long long)hist->row[i].records,
+                      (unsigned long long)hist->row[i].bytes);
+    }
+    ops_sb_printf(sb, "],\"generation_history_total\":%llu",
+                  (unsigned long long)hist->total);
+    ops_sb_puts(sb, ",\"generation_history_truncated\":");
+    ops_sb_puts(sb, hist->truncated ? "true" : "false");
     ops_sb_puts(sb, "}");
 }
 
@@ -1575,7 +2148,17 @@ int sfb_stats_json(const char *path, const char *key, char *out, size_t cap)
     uint32_t dim = 0;
     int rc = ops_probe_dim(path, &dim);
     if (rc != SFB_OK) {
-        ops_sb_printf(&sb, "{\"ok\":false,\"errors\":[\"manifest_unreadable: SFB error %d\"]}", rc);
+        /* Say what an operator can act on: verify already answers "not_a_store"
+         * for a mistyped path, so stats must not hand back a bare code instead. */
+        char msg[320];
+        if (!ops_is_dir(path))
+            sfb_snprintf(msg, sizeof msg, "not_a_store: %s is not a directory", path);
+        else
+            sfb_snprintf(msg, sizeof msg, "manifest_unreadable: %s (%d)",
+                         sfb_strerror(rc), rc);
+        ops_sb_puts(&sb, "{\"ok\":false,\"errors\":[");
+        ops_json_str(&sb, msg);
+        ops_sb_puts(&sb, "]}");
         ops_json_flush(&sb, out, cap);
         ops_sb_free(&sb);
         return rc;
@@ -1593,7 +2176,13 @@ int sfb_stats_json(const char *path, const char *key, char *out, size_t cap)
     sfb_brain_t *b = NULL;
     rc = sfb_open(&cfg, &b);
     if (rc != SFB_OK || !b) {
-        ops_sb_printf(&sb, "{\"ok\":false,\"errors\":[\"open_failed: SFB error %d\"]}", rc);
+        char msg[320];
+        sfb_snprintf(msg, sizeof msg, "open_failed: %s (%d)", sfb_strerror(rc), rc);
+        ops_sb_puts(&sb, "{\"ok\":false,\"errors\":[");
+        ops_json_str(&sb, msg);
+        ops_sb_puts(&sb, "],\"path\":");
+        ops_json_str(&sb, path);
+        ops_sb_puts(&sb, "}");
         ops_json_flush(&sb, out, cap);
         ops_sb_free(&sb);
         return rc != SFB_OK ? rc : SFB_E_STATE;
@@ -1604,58 +2193,71 @@ int sfb_stats_json(const char *path, const char *key, char *out, size_t cap)
     rc = sfb_stats_get(b, &st);
     if (rc != SFB_OK) {
         (void)sfb_close(b);
-        ops_sb_printf(&sb, "{\"ok\":false,\"errors\":[\"stats_failed: SFB error %d\"]}", rc);
+        ops_sb_printf(&sb, "{\"ok\":false,\"errors\":[\"stats_failed: %s (%d)\"]}",
+                      sfb_strerror(rc), rc);
         ops_json_flush(&sb, out, cap);
         ops_sb_free(&sb);
         return rc;
     }
-    ops_stats_json_emit(&sb, path, dim, &st);
+    rc = sfb_close(b);
+    if (rc != SFB_OK) {
+        ops_sb_printf(&sb, "{\"ok\":false,\"errors\":[\"close_failed: %s (%d)\"]}",
+                      sfb_strerror(rc), rc);
+        ops_json_flush(&sb, out, cap);
+        ops_sb_free(&sb);
+        return rc;
+    }
+
+    /* W7.4(a): the same detection verify uses, cheap enough for a stats call
+     * (assumption A10). The report is only as honest as this scan. */
+    ops_health_t health;
+    ops_gen_hist_t hist;
+    int hrc = ops_health_scan(path, &health, &hist);
+    int ok = (hrc == SFB_OK) && health.ok;
+    if (hrc != SFB_OK) {
+        memset(&health, 0, sizeof health);
+        memset(&hist, 0, sizeof hist);
+        ops_list_add(&health.errors, "health_scan_failed: SFB error %d", hrc);
+        ok = 0;
+    }
+    ops_stats_json_emit(&sb, path, dim, &st, &health, &hist, ok);
     ops_json_flush(&sb, out, cap);
+    int oom = sb.oom;
     ops_sb_free(&sb);
 
-    rc = sfb_close(b);
-    if (rc != SFB_OK) return rc;
-    if (sb.oom) return SFB_E_NOMEM;
-    return SFB_OK;
+    if (oom) return SFB_E_NOMEM;
+    return ok ? SFB_OK : SFB_E_CORRUPT;
 }
 
 /* ── migrate: v1 single-file brain → v2 segmented store (W7.5) ─────────── */
 /*
- * v1 record layout is unknown here, and inventing one would corrupt data, so
- * this function is deliberately honest about what it can and cannot do:
+ * Routing, by the source's first four bytes:
  *
- *   • first 4 bytes == SFB_MAGIC_MANIFEST   → already v2: no-op copy of the
- *     whole store into dst (segments first, manifest last). If dst already
- *     holds a v2 store, this is a pure no-op and SFB_OK.
- *   • first 4 bytes == "QTS\x01"            → a QTSQ v1 container. Decoding it
- *     needs the QTSQ stream reader, which is out of scope for this pass:
- *     SFB_E_INVALID plus a JSON reason on stderr.
- *   • anything else                          → SFB_E_INVALID plus a JSON reason
- *     naming the magic we saw.
+ *   • SFB_MAGIC_MANIFEST  → already v2: a verbatim copy of the whole store into
+ *     dst (segments first, manifest last). If dst already holds a v2 store this
+ *     is a pure no-op. Nothing is re-encoded in either case.
+ *   • "QTS\x01"           → a QTSQ v1 container, imported by ops_migrate_v1()
+ *     (a real import: one record per row of the `memories` matrix).
+ *   • anything else       → SFB_E_INVALID plus a JSON reason naming the magic.
  *
- * The frozen ABI (int sfb_migrate) has no report parameter, so the JSON goes to
- * stderr — see assumption A8.
+ * The frozen ABI (int sfb_migrate) has no report parameter, so the report is
+ * written to stderr as one JSON object (assumption A8). sfb_ops_migrate_report()
+ * runs the same `ops_migrate_run` and hands the JSON back instead of printing
+ * it, which is what `sfb migrate --json` uses.
  */
-static int ops_migrate_refuse(const char *src, const char *code, const char *reason,
-                              uint32_t magic)
+static int ops_migrate_refuse(ops_sb_t *sb, const char *src, const char *code,
+                              const char *reason, uint32_t magic)
 {
-    ops_sb_t sb;
-    ops_sb_init(&sb);
-    ops_sb_puts(&sb, "{\"ok\":false,\"error\":");
-    ops_json_str(&sb, code);
-    ops_sb_puts(&sb, ",\"path\":");
-    ops_json_str(&sb, src);
-    ops_sb_printf(&sb, ",\"magic\":\"0x%08x\"", magic);
-    ops_sb_puts(&sb, ",\"reason\":");
-    ops_json_str(&sb, reason);
-    ops_sb_puts(&sb, "}");
-    if (sb.p && !sb.oom) fprintf(stderr, "%s\n", sb.p);
-    else fprintf(stderr, "{\"ok\":false,\"error\":\"%s\",\"reason\":\"%s\"}\n", code, reason);
-    fflush(stderr);
-    ops_sb_free(&sb);
+    ops_sb_puts(sb, "{\"ok\":false,\"error\":");
+    ops_json_str(sb, code);
+    ops_sb_puts(sb, ",\"path\":");
+    ops_json_str(sb, src);
+    ops_sb_printf(sb, ",\"magic\":\"0x%08x\"", magic);
+    ops_sb_puts(sb, ",\"reason\":");
+    ops_json_str(sb, reason);
+    ops_sb_puts(sb, "}");
     return SFB_E_INVALID;
 }
-
 
 /* ── v1 QTSQ brain import (W7.5) ────────────────────────────────────────────
  * A v1 brain is a single QTSQ container holding the network weights, neuron
@@ -1667,8 +2269,8 @@ static int ops_migrate_refuse(const char *src, const char *code, const char *rea
  * The source is copied to "<src>.v1backup" before anything is written, so the
  * pre-migration state survives even if the import is later rejected.
  * ─────────────────────────────────────────────────────────────────────────── */
-static int ops_migrate_v1(const char *src, const char *dst, const char *key,
-                          uint32_t magic)
+static int ops_migrate_v1(ops_sb_t *sb, const char *src, const char *dst,
+                          const char *key, uint32_t magic)
 {
     qtsq_context_t c;
     float *mems = NULL;
@@ -1680,7 +2282,7 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
     rc = qtsq_read(&c, src);
     if (rc != QTSQ_OK) {
         qtsq_free(&c);
-        return ops_migrate_refuse(src, "v1_read_failed",
+        return ops_migrate_refuse(sb, src, "v1_read_failed",
                                   "QTSQ refused to read the container", magic);
     }
 
@@ -1690,13 +2292,13 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
         if (key == NULL || key[0] == '\0') {
             qtsq_free(&c);
             return ops_migrate_refuse(
-                src, "v1_key_required",
+                sb, src, "v1_key_required",
                 "the v1 container is encrypted; pass the passphrase to migrate",
                 magic);
         }
         if (qtsq_decrypt(&c, key) != QTSQ_OK) {
             qtsq_free(&c);
-            return ops_migrate_refuse(src, "v1_decrypt_failed",
+            return ops_migrate_refuse(sb, src, "v1_decrypt_failed",
                                       "the passphrase does not open this v1 container",
                                       magic);
         }
@@ -1706,8 +2308,8 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
     rc = qtsq_container_get_count(&c, &nstreams);
     if (rc != QTSQ_OK) {
         qtsq_free(&c);
-        return ops_migrate_refuse(src, "v1_streams_unreadable",
-                                 "the container has no readable stream table", magic);
+        return ops_migrate_refuse(sb, src, "v1_streams_unreadable",
+                                  "the container has no readable stream table", magic);
     }
 
     for (i = 0; i < nstreams; i++) {
@@ -1741,20 +2343,20 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
 
     if (!seen_memories || mems == NULL || count == 0) {
         free(mems);
-        return ops_migrate_refuse(src, "v1_has_no_memories",
+        return ops_migrate_refuse(sb, src, "v1_has_no_memories",
                                   "the v1 container holds no memory stream to import",
                                   magic);
     }
     if (vdim == 0 || nmem == 0 || nmem * vdim != count) {
         free(mems);
         return ops_migrate_refuse(
-            src, "v1_unknown_shape",
+            sb, src, "v1_unknown_shape",
             "the memory stream does not declare a usable {rows, vector_dim} shape",
             magic);
     }
     if (vdim < 64u || vdim > 4096u) {
         free(mems);
-        return ops_migrate_refuse(src, "v1_unsupported_dimension",
+        return ops_migrate_refuse(sb, src, "v1_unsupported_dimension",
                                   "v1 vector_dim is outside the v2 range 64..4096", magic);
     }
 
@@ -1766,21 +2368,7 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
             ops_is_file(dman)) {
             free(mems);
             return ops_migrate_refuse(
-                src, "dest_not_empty",
-                "the destination is already a v2 store; migrate needs an empty path",
-                magic);
-        }
-    }
-
-    /* Never import into a store that already holds data: rerunning migrate
-     * would silently duplicate every record (dedup is KEEP_BOTH here). */
-    if (ops_is_dir(dst)) {
-        char dman[4200];
-        if (sfb_path_join(dman, sizeof dman, dst, SFB_MANIFEST_NAME) == SFB_OK &&
-            ops_is_file(dman)) {
-            free(mems);
-            return ops_migrate_refuse(
-                src, "dest_not_empty",
+                sb, src, "dest_not_empty",
                 "the destination is already a v2 store; migrate needs an empty path",
                 magic);
         }
@@ -1788,11 +2376,12 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
 
     /* pre-migration snapshot of the source, never overwritten */
     char backup[4200];
+    backup[0] = '\0';
     if (sfb_snprintf(backup, sizeof backup, "%s.v1backup", src) >= 0 &&
         !ops_is_file(backup)) {
         if (ops_copy_file(src, backup) != SFB_OK) {
             free(mems);
-            return ops_migrate_refuse(src, "backup_failed",
+            return ops_migrate_refuse(sb, src, "backup_failed",
                                       "could not write the pre-migration snapshot", magic);
         }
     }
@@ -1810,7 +2399,7 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
         char why[160];
         snprintf(why, sizeof why, "cannot open the destination store: %s",
                  sfb_strerror(rc));
-        return ops_migrate_refuse(src, "dest_open_failed", why, magic);
+        return ops_migrate_refuse(sb, src, "dest_open_failed", why, magic);
     }
 
     uint64_t imported = 0, rejected = 0;
@@ -1825,56 +2414,62 @@ static int ops_migrate_v1(const char *src, const char *dst, const char *key,
     }
     sfb_flush_result_t fr;
     int frc = sfb_flush(b, &fr);
-    sfb_close(b);
+    (void)sfb_close(b);
     free(mems);
 
     if (frc != SFB_OK) {
-        fprintf(stderr, "{\"ok\":false,\"v1\":true,\"error\":\"flush_failed\","
-                        "\"code\":%d,\"imported\":%llu}\n", frc,
-                (unsigned long long)imported);
+        ops_sb_puts(sb, "{\"ok\":false,\"v1\":true,\"error\":\"flush_failed\",");
+        ops_sb_printf(sb, "\"code\":%d,\"imported\":%llu}", frc,
+                      (unsigned long long)imported);
         return frc;
     }
-    fprintf(stderr, "{\"ok\":true,\"v1\":true,\"action\":\"imported\","
-                    "\"records\":%llu,\"rejected\":%llu,\"dim\":%zu,"
-                    "\"backup\":\"%s\"}\n",
-            (unsigned long long)imported, (unsigned long long)rejected,
-            vdim, backup);
+    /* The real import: say how many rows became v2 records, how many the store
+     * refused, and where the pre-migration snapshot is. */
+    ops_sb_puts(sb, "{\"ok\":true,\"v1\":true,\"action\":\"imported\",");
+    ops_sb_printf(sb, "\"records\":%llu,\"rejected\":%llu,\"dim\":%zu,\"backup\":",
+                  (unsigned long long)imported, (unsigned long long)rejected, vdim);
+    ops_json_str(sb, backup);
+    ops_sb_puts(sb, "}");
     return SFB_OK;
 }
 
-int sfb_migrate(const char *src_path, const char *dst_path, const char *key)
+static int ops_migrate_run(ops_sb_t *sb, const char *src_path,
+                           const char *dst_path, const char *key)
 {
     if (!src_path || !src_path[0] || !dst_path || !dst_path[0]) {
-        return ops_migrate_refuse(src_path ? src_path : "", "invalid_argument",
-                                 "both src_path and dst_path are required", 0);
+        return ops_migrate_refuse(sb, src_path ? src_path : "",
+                                  "invalid_argument",
+                                  "both src_path and dst_path are required", 0);
     }
     /* key is forwarded to the importer, which KDFs it for the v2 store */
 
     if (strcmp(src_path, dst_path) == 0) {
-        return ops_migrate_refuse(src_path, "same_path",
-                                 "src_path and dst_path are the same path", 0);
+        return ops_migrate_refuse(sb, src_path, "same_path",
+                                  "src_path and dst_path are the same path", 0);
     }
     if (ops_is_file(dst_path)) {
-        return ops_migrate_refuse(src_path, "dest_is_a_file",
-                                 "dst_path exists and is a regular file, not a store "
-                                 "directory", 0);
+        return ops_migrate_refuse(sb, src_path, "dest_is_a_file",
+                                  "dst_path exists and is a regular file, not a store "
+                                  "directory", 0);
     }
 
     if (!ops_is_file(src_path)) {
-        return ops_migrate_refuse(src_path, "source_missing",
-                                 "src_path is not a regular file", 0);
+        return ops_migrate_refuse(sb, src_path, "source_missing",
+                                  "src_path is not a regular file", 0);
     }
 
     /* v2 files are a directory layout; a lone file can only be a v1 brain or a
      * copy of our manifest. */
     uint8_t head[4] = {0};
     int fd = open(src_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return ops_migrate_refuse(src_path, "io_error", "cannot open source", 0);
+    if (fd < 0)
+        return ops_migrate_refuse(sb, src_path, "io_error",
+                                  "cannot open source", 0);
     ssize_t got = pread(fd, head, sizeof head, 0);
     close(fd);
     if (got < 4)
-        return ops_migrate_refuse(src_path, "source_too_short",
-                                 "source is smaller than 4 bytes; not a brain", 0);
+        return ops_migrate_refuse(sb, src_path, "source_too_short",
+                                  "source is smaller than 4 bytes; not a brain", 0);
 
     uint32_t magic;
     memcpy(&magic, head, sizeof magic);
@@ -1887,25 +2482,28 @@ int sfb_migrate(const char *src_path, const char *dst_path, const char *key)
         if (slash) *slash = '\0';
         else snprintf(src_dir, sizeof src_dir, ".");
         if (!ops_is_dir(src_dir)) {
-            return ops_migrate_refuse(src_path, "v2_manifest_without_directory",
-                                     "source is a v2 manifest but its directory is gone", magic);
+            return ops_migrate_refuse(sb, src_path,
+                                      "v2_manifest_without_directory",
+                                      "source is a v2 manifest but its directory is gone",
+                                      magic);
         }
         /* If dst already is a v2 store, migration is a no-op. */
         char dman[4096];
         if (ops_is_dir(dst_path) &&
             sfb_path_join(dman, sizeof dman, dst_path, SFB_MANIFEST_NAME) == 0 &&
             ops_is_file(dman)) {
-            fprintf(stderr, "{\"ok\":true,\"already_v2\":true,\"action\":\"noop\"}\n");
+            ops_sb_puts(sb, "{\"ok\":true,\"already_v2\":true,\"action\":\"noop\"}");
             return SFB_OK;
         }
-        int rc = ops_copy_store(src_dir, dst_path, 0);
+        int rc = ops_copy_store(src_dir, dst_path, 0, NULL);
         if (rc != SFB_OK) {
-            fprintf(stderr, "{\"ok\":false,\"already_v2\":true,\"error\":\"copy_failed\","
-                            "\"code\":%d}\n", rc);
+            ops_sb_puts(sb, "{\"ok\":false,\"already_v2\":true,"
+                            "\"error\":\"copy_failed\",");
+            ops_sb_printf(sb, "\"code\":%d}", rc);
             return rc;
         }
         /* a v2 source is a no-op in content terms: nothing is re-encoded */
-        fprintf(stderr, "{\"ok\":true,\"already_v2\":true,\"action\":\"copied\"}\n");
+        ops_sb_puts(sb, "{\"ok\":true,\"already_v2\":true,\"action\":\"copied\"}");
         return SFB_OK;
     }
 
@@ -1913,16 +2511,47 @@ int sfb_migrate(const char *src_path, const char *dst_path, const char *key)
     char sidecar[4096];
     snprintf(sidecar, sizeof sidecar, "%s.d", src_path);
     if (ops_is_dir(sidecar)) {
-        return ops_migrate_refuse(src_path, "ambiguous_layout",
-                                 "source has a .d directory but a non-v2 magic; "
-                                 "not a v1 single-file brain", magic);
+        return ops_migrate_refuse(sb, src_path, "ambiguous_layout",
+                                  "source has a .d directory but a non-v2 magic; "
+                                  "not a v1 single-file brain", magic);
     }
 
-    /* ---- QTSQ container: recognised, but not importable in this pass ---- */
+    /* ---- QTSQ v1 container: a real import ------------------------------- */
     if (head[0] == 'Q' && head[1] == 'T' && head[2] == 'S' && head[3] == 0x01) {
-        return ops_migrate_v1(src_path, dst_path, key, magic);
+        return ops_migrate_v1(sb, src_path, dst_path, key, magic);
     }
 
-    return ops_migrate_refuse(src_path, "unrecognised_v1_layout",
-                             "unknown v1 layout: no importer for this magic", magic);
+    return ops_migrate_refuse(sb, src_path, "unrecognised_v1_layout",
+                              "unknown v1 layout: no importer for this magic", magic);
+}
+
+/* Non-ABI entry point (see A8/A9): the same migration, with the report handed
+ * back to the caller instead of printed. `sfb migrate --json` uses this. */
+int sfb_ops_migrate_report(const char *src_path, const char *dst_path,
+                           const char *key, char *json_out, size_t json_cap)
+{
+    ops_sb_t sb;
+    int rc;
+
+    ops_sb_init(&sb);
+    rc = ops_migrate_run(&sb, src_path, dst_path, key);
+    ops_json_flush(&sb, json_out, json_cap);
+    ops_sb_free(&sb);
+    return rc;
+}
+
+int sfb_migrate(const char *src_path, const char *dst_path, const char *key)
+{
+    ops_sb_t sb;
+    int rc;
+
+    ops_sb_init(&sb);
+    rc = ops_migrate_run(&sb, src_path, dst_path, key);
+    /* A8: the frozen ABI has no report parameter, so the machine-readable
+     * report goes to stderr — one JSON object, always valid. */
+    if (sb.p && !sb.oom) fprintf(stderr, "%s\n", sb.p);
+    else fprintf(stderr, "{\"ok\":false,\"error\":\"internal_error\"}\n");
+    fflush(stderr);
+    ops_sb_free(&sb);
+    return rc;
 }

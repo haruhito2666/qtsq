@@ -58,13 +58,26 @@
  *   bit 1  SFB_SEG_FLAG_INT8    payload records hold int8 codes plus a
  *                               per-record f32 scale table instead of f32
  *                               vectors (W3.6)
+ *   bit 3  SFB_SEG_FLAG_RECCRC_FULL
+ *                               each record's stored CRC32C covers the WHOLE
+ *                               record: the 24-byte head, both f64 timestamps,
+ *                               text, role and the vector payload (f32 bytes,
+ *                               or the int8 codes plus that record's f32
+ *                               scale).  Without the bit the CRC covers only
+ *                               head+text+role, which is what every segment
+ *                               written before W3.5 says (W3.5).
+ * Bit 2 stays deliberately unassigned: an existing regression test patches it
+ * in to prove that an unknown flag bit is a loud SFB_E_CORRUPT, and that test
+ * must keep meeting an unknown bit.
  * Every other bit is a payload encoding this build does not know.  The header
  * decoder rejects the whole segment with SFB_E_CORRUPT, so an older build
- * meeting an int8 segment fails loudly instead of reading int8 bytes as f32.
- * The manifest format is deliberately untouched: bit 1 lives per segment, so a
- * mixed store (old f32 segments + new int8 ones) stays readable by both. */
-#define SFB_SEG_FLAG_SEALED 0x0001u
-#define SFB_SEG_FLAG_INT8   0x0002u
+ * meeting an int8 or a full-record-CRC segment fails loudly instead of
+ * misparsing the payload.  The manifest format is deliberately untouched: both
+ * bits live per segment, so a mixed store (legacy segments + new ones) stays
+ * readable, and legacy segments keep their legacy CRC span. */
+#define SFB_SEG_FLAG_SEALED      0x0001u
+#define SFB_SEG_FLAG_INT8        0x0002u
+#define SFB_SEG_FLAG_RECCRC_FULL 0x0008u
 
 /* record flags */
 #define SFB_F_LIVE      0x01u
@@ -156,6 +169,20 @@ int  sfb_hnsw_load(sfb_hnsw_t **out, const char *path, uint32_t dim,
                    uint32_t m, uint32_t m0, uint32_t ef_construction);
 
 /* ── store (sfb_store.c) ───────────────────────────────────────────────── */
+/* Manifest geometry and flag bits.  These are part of the on-disk contract, so
+ * they live next to sfb_manifest_t rather than inside sfb_store.c: sfb_ops.c
+ * re-saves manifests through the store, and the W5.3 tests build a legacy
+ * manifest by hand from exactly these numbers.  Layout, and the reason the
+ * version field is still 2, are documented at the top of sfb_store.c. */
+#define SFB_MAN_HDR_LEN     48u
+#define SFB_MAN_ENT_LEN     32u
+#define SFB_MAN_F_ENCRYPTED 0x0001u
+#define SFB_MAN_F_POLICY    0x0002u   /* optional decay-policy block follows   */
+#define SFB_MAN_FLAGS_KNOWN (SFB_MAN_F_ENCRYPTED | SFB_MAN_F_POLICY)
+#define SFB_MAN_POLICY_LEN  24u
+#define SFB_MAGIC_POLICY    0x53465032u   /* 'SFP2' */
+#define SFB_POLICY_VERSION  1u
+
 typedef struct sfb_seg_entry {
     uint32_t gen, seq;
     uint32_t records;
@@ -163,6 +190,26 @@ typedef struct sfb_seg_entry {
     uint32_t digest;
     uint32_t min_id, max_id;
 } sfb_seg_entry_t;
+
+/* ── decay policy persisted in the manifest (W5.3) ───────────────────────
+ * A brain's forgetting behaviour is part of the brain, not of the call that
+ * happens to open it: a store configured `decay = EXPONENTIAL` must come back
+ * exponential after a reopen with a zeroed config, instead of silently
+ * becoming NONE and never forgetting again.  The policy is stored as an
+ * OPTIONAL extension block in the manifest (see sfb_store.c), so:
+ *   • a store written before W5.3 has no block and reads as present == 0;
+ *   • a store whose caller never expressed a policy keeps the legacy layout
+ *     byte for byte (nothing is upgraded behind the user's back);
+ *   • a consumer that does not know the block rejects the manifest with
+ *     SFB_E_CORRUPT instead of misreading the segment table.
+ * TTL uses the same half-life as EXPONENTIAL: a row expires once its age
+ * exceeds 2 * half_life_secs (that is what sfb_decay_tick has always done). */
+typedef struct sfb_decay_policy {
+    int      present;         /* 0 == no policy block on disk               */
+    uint16_t mode;            /* sfb_decay_t: NONE / EXPONENTIAL / TTL       */
+    double   half_life_secs;  /* > 0; drives decay and the TTL deadline      */
+    double   decay_floor;     /* > 0; strength under which a row demotes     */
+} sfb_decay_policy_t;
 
 typedef struct sfb_manifest {
     uint32_t magic;
@@ -176,6 +223,7 @@ typedef struct sfb_manifest {
     uint32_t nseg;
     uint64_t total_bytes;
     sfb_seg_entry_t *segs;
+    sfb_decay_policy_t policy;  /* W5.3, optional; see sfb_store.c          */
     uint32_t crc;          /* CRC32C over the header + segment table (W1.4) */
 } sfb_manifest_t;
 
@@ -193,6 +241,15 @@ typedef struct sfb_store {
     uint32_t dim;
     uint64_t records_dropped, segments_quarantined, ids_renumbered, index_rebuilt;
     uint64_t bytes_written;
+    /* W3.3: observability for the lazy-open gate.  A metadata-only open reads
+     * zero segments; the count is what the `open` event reports so a test (and
+     * an operator) can tell a manifest-only open from a full replay. */
+    uint64_t segments_read;         /* payload reads (W3.3 diagnostics)      */
+    uint64_t segments_verified;     /* payload CRC + digest checks done      */
+    /* W3.4: a publish may have superseded files, or a .tmp/.quarantine may be
+     * lying around.  Set by the paths that know, so a full directory scan only
+     * happens when there is something to collect. */
+    int      reclaim_pending;
 } sfb_store_t;
 
 int  sfb_store_open(sfb_store_t *s, const sfb_config_t *cfg, int *fresh);
@@ -203,6 +260,13 @@ int  sfb_store_manifest_load(sfb_store_t *s);
 int  sfb_store_segment_write(sfb_store_t *s, const void *data, size_t len,
                              uint32_t records, uint32_t min_id, uint32_t max_id,
                              uint32_t *out_seq);
+/* Same, plus extra SFB_SEG_FLAG_* bits the writer wants in the header.
+ * sfb_brain.c passes SFB_SEG_FLAG_RECCRC_FULL (W3.5); the store adds
+ * SFB_SEG_FLAG_SEALED / SFB_SEG_FLAG_INT8 itself.  extra_flags may be 0, which
+ * makes this byte-identical to sfb_store_segment_write(). */
+int  sfb_store_segment_write_ex(sfb_store_t *s, const void *data, size_t len,
+                                uint32_t records, uint32_t min_id, uint32_t max_id,
+                                uint16_t extra_flags, uint32_t *out_seq);
 int  sfb_store_segment_read(const sfb_store_t *s, const sfb_seg_entry_t *e,
                             void **out, size_t *len);
 /* Same, but also reports the segment header flags (SFB_SEG_FLAG_*), which is
@@ -210,10 +274,28 @@ int  sfb_store_segment_read(const sfb_store_t *s, const sfb_seg_entry_t *e,
  * int8.  flags_out may be NULL. */
 int  sfb_store_segment_read_ex(const sfb_store_t *s, const sfb_seg_entry_t *e,
                                void **out, size_t *len, uint16_t *flags_out);
+/* W3.5 isolation read: validates everything that says the segment is a complete,
+ * structurally intact segment (length vs manifest, header, GCM authentication)
+ * but tolerates a payload-CRC / whole-file-digest mismatch, because that is
+ * exactly the damage (one flipped bit) a per-record CRC can attribute to a
+ * single record.  Returns SFB_E_CORRUPT for structural damage, so a truncated
+ * or torn segment is still rejected as a unit.  Only the brain's replay path
+ * uses this, and only after the strict read has failed. */
+int  sfb_store_segment_read_damaged(const sfb_store_t *s, const sfb_seg_entry_t *e,
+                                    void **out, size_t *len, uint16_t *flags_out);
+/* Cheap structural probe: file size vs manifest entry + header decode, without
+ * reading the payload.  This is what a metadata-only open uses to keep a torn
+ * NEWEST segment a loud failure (W3.3). */
+int  sfb_store_segment_probe(const sfb_store_t *s, const sfb_seg_entry_t *e);
 int  sfb_store_segment_verify(const sfb_store_t *s, const sfb_seg_entry_t *e);
 int  sfb_store_quarantine(sfb_store_t *s, const sfb_seg_entry_t *e);
 /* reclamation: drop generations no longer referenced (W3.4) */
 int  sfb_store_reclaim(sfb_store_t *s, uint64_t *files_removed);
+/* W3.4: ask for a sweep, and run one only when something asked.  The brain
+ * requests a sweep when its publish superseded segment/graph files; the store
+ * also requests one when it quarantines a segment or leaves a .tmp behind. */
+void sfb_store_reclaim_request(sfb_store_t *s);
+int  sfb_store_reclaim_auto(sfb_store_t *s, uint64_t *files_removed);
 uint64_t sfb_store_bytes_on_disk(const sfb_store_t *s);
 int  sfb_store_wal_begin(sfb_store_t *s, const char *intent, size_t len, uint32_t digest);
 int  sfb_store_wal_commit(sfb_store_t *s);
@@ -254,8 +336,44 @@ int sfb_quant_decode_vec(const int8_t *codes, uint32_t dim, float scale,
 
 /* ── text (sfb_text.c) ─────────────────────────────────────────────────── */
 double sfb_text_jaccard(const char *a, const char *b);
+/* Single-document BM25: N == df == 1, so idf is the constant ln(4/3).  Kept
+ * for callers that have no corpus (and for the frozen unit tests); a ranking
+ * over a corpus should use the stats form below instead (W4.6). */
 double sfb_text_bm25(const char *query, const char *doc, double avg_len, double k1, double b);
 uint64_t sfb_text_hash(const char *s);
+
+/* ── BM25 with real corpus statistics (W4.6) ────────────────────────────
+ * sfb_text_bm25() above cannot compute idf: it only sees one document.  These
+ * calls give the caller a real idf without teaching sfb_text.c about the
+ * brain's row store:
+ *
+ *   sfb_text_stats_begin(st, query)   tokenise the query once (≤ 256 terms)
+ *   sfb_text_stats_add(st, doc)       one pass over one document: total
+ *                                     length + df for each query term
+ *   sfb_text_bm25_stats(st, doc, …)   BM25 for one document with
+ *                                     idf = ln(1 + (N - df + 0.5)/(df + 0.5))
+ *
+ * Every live document must be passed to sfb_text_stats_add(), including ones
+ * that contain no query term, because N and the average length are corpus
+ * statistics.  Cost, stated plainly: one tokenisation of every document for
+ * the df pass plus one per document for scoring — two linear passes over the
+ * corpus per query, no allocation, and df is exact (not sampled).  The struct
+ * is ~6 KiB and is caller-allocated so the helpers stay reentrant. */
+#define SFB_TEXT_STATS_SLOTS 512u
+
+typedef struct sfb_text_stats {
+    uint64_t key[SFB_TEXT_STATS_SLOTS];       /* query term hash            */
+    uint32_t in_query[SFB_TEXT_STATS_SLOTS];  /* 1 == slot holds a term     */
+    uint32_t df[SFB_TEXT_STATS_SLOTS];        /* document frequency         */
+    uint32_t nterms;                          /* distinct query terms       */
+    uint32_t n_docs;                          /* documents seen             */
+    double   total_len;                       /* sum of token counts        */
+} sfb_text_stats_t;
+
+void   sfb_text_stats_begin(sfb_text_stats_t *st, const char *query);
+void   sfb_text_stats_add(sfb_text_stats_t *st, const char *doc);
+double sfb_text_bm25_stats(const sfb_text_stats_t *st, const char *doc,
+                           double k1, double b);
 
 /* ── the brain (sfb_brain.c) ───────────────────────────────────────────── */
 /* The vector store holds exactly one copy per row of whatever the brain is
@@ -296,6 +414,10 @@ struct sfb_brain {
     sfb_event_cb       event_cb;
     void              *event_ud;
     int                event_tail_text;
+    /* W3.3: segments are replayed on first data access, not at open, so a
+     * metadata-only open costs a manifest read.  Every public entry point that
+     * touches rows calls brain_ensure_loaded() first. */
+    int                loaded;
 };
 
 /* shared internals used by sfb_ops.c */
@@ -309,5 +431,11 @@ int  sfb_brain_replay_segment(sfb_brain_t *b, const void *data, size_t len,
                               uint32_t records);
 int  sfb_brain_serialize_dirty(sfb_brain_t *b, void **out, size_t *len,
                                uint32_t *n_records, uint32_t *min_id, uint32_t *max_id);
+/* Same, but serialises at most max_records dirty rows (ascending id, the same
+ * order the unlimited form uses).  max_records == 0 means "no limit".  Flush
+ * uses SFB_SEGMENT_CAP so no segment ever exceeds the cap (W3.2). */
+int  sfb_brain_serialize_dirty_n(sfb_brain_t *b, void **out, size_t *len,
+                                 uint32_t *n_records, uint32_t *min_id,
+                                 uint32_t *max_id, uint32_t max_records);
 
 #endif /* SFB_INTERNAL_H */

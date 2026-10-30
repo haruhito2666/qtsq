@@ -537,6 +537,7 @@ static void test_footprint_and_layout(const char *df, const char *dq,
         b = NULL;
         CK(sfb_open(&c, &b) == SFB_OK);
         if (b != NULL) {
+            (void)sfb_brain_load_all(b); /* W3.3: open is lazy; materialise to compare layouts */
             CK_MSG(b->vecs.vecs != NULL, "f32 brain has no f32 vector array");
             CK_MSG(b->vecs.qcodes == NULL, "f32 brain also kept int8 codes");
             vec_f32 = b->vecs.dim * sizeof(float);
@@ -547,6 +548,7 @@ static void test_footprint_and_layout(const char *df, const char *dq,
         b = NULL;
         CK(sfb_open(&c, &b) == SFB_OK);
         if (b != NULL) {
+            (void)sfb_brain_load_all(b); /* W3.3: open is lazy; the check is about layout */
             CK_MSG(b->vecs.vecs == NULL,
                    "int8 brain still holds a redundant f32 corpus copy");
             CK_MSG(b->vecs.qcodes != NULL && b->vecs.qscale != NULL,

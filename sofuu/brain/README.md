@@ -42,6 +42,8 @@ if (sfb_open(&cfg, &b) != SFB_OK) { /* SFB_E_LOCKED, SFB_E_CORRUPT, ... */ }
 
 sfb_remember_result_t r;
 sfb_remember(b, vec, "text", "user", &r);   /* r.merged / r.into are honest */
+/* The JS surface reports the same thing: remember() returns
+ * { id, merged } on an insert and { id, merged, into } on a merge. */
 
 sfb_hit_t hits[10]; uint32_t n;
 sfb_recall(b, query, 10, hits, &n);
@@ -56,7 +58,12 @@ sfb_close(b);
 | Guarantee | Mechanism |
 |---|---|
 | A damaged manifest never becomes an empty brain | CRC32C over header + segment table; `SFB_E_CORRUPT` instead of silent zero (W1.4) |
-| One bit-flip costs one record, not 256 | per-record CRC32C in the segment payload (W3.5) |
+| One bit-flip costs one record, not 256 | per-record CRC32C over the WHOLE record (vector included) behind segment flag bit3; replay drops only the damaged row (W3.5). A truncated segment still falls as a unit — a half-written segment is not a record-level fault |
+| A read-only open writes nothing | readers take `O_RDONLY` + `flock(LOCK_SH)`, or a shared flock on the store directory when no lock file exists; no file is created, truncated or recorded (W2.3) |
+| Opening a brain does not replay it | `sfb_open` reads the manifest and probes the newest segment header; payloads load on first row access. `verify_full` is the paranoid path (W3.3) |
+| A pinned row never drops below 0.2 | the floor is an invariant, not a `pins_immune` knob (W5.4) |
+| A brain keeps forgetting across a restart | decay mode / half-life / floor persist in the manifest (optional 24-byte block, flag bit1) and are inherited by a config silent about decay (W5.3) |
+| Steady-state disk does not grow | superseded generations are reclaimed on flush without an explicit `sfb_compact` — measured ~1.19x amplification over 5 cycles (W3.4) |
 | No silent short writes | staged size checked before publish; `EFBIG`/`ENOSPC` ⇒ `SFB_E_ENOSPC` (W1.6) |
 | One writer, many readers | `flock(LOCK_EX/LOCK_SH)` + pid record; stale pids reclaimed (W2.1–2.3) |
 | Multi-agent without lock churn | `sfb_broker_run()` on a UNIX socket (W2.4) |
@@ -87,7 +94,7 @@ sfb_close(b);
 | INT8 quantisation error | 0.445 % max, 0.286 % RMS | <= 1.5 % |
 | INT8 footprint (persisted) | **3.36x smaller** whole store (3.02x sealed) | 4x payload |
 | exact dimension enforcement | wrong-length write/query -> `SFB_E_DIM`, no OOB read | refused |
-| unit checks | **~13,250 across 12 suites** + 27 socket checks + 7 chaos cases | all pass |
+| unit checks | **13,637 across 16 suites** + 27 socket checks + 7 chaos cases | all pass |
 
 Known cost: ingest is **13.8 ms/record at dim 768** (3.7 ms at dim 384), dominated by the
 diversity heuristic at `efConstruction=200`. Correctness is not in question (100 % recall
