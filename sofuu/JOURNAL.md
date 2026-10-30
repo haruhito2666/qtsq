@@ -704,6 +704,40 @@ still refused.
 **68 passed, 0 failed, 1 skipped**; C `make test` → **18 suites + serve, 0 failures**.
 
 
+### 2026-10-30 (later) — W3.1 was half-built: the snapshot existed but nothing called it
+
+The entry above claimed W3.1 closed. It was not. `Hnsw::save_to` /
+`load_with_vectors` were implemented and tested, but their only callers were inside
+`brain_store.rs`'s test module — no production code wrote a graph snapshot and no load
+ever read one, so every open rebuilt the HNSW index by inserting each vector (one full
+search per record). That is what the gate run was actually measuring.
+
+**Wired now:** flush writes `graph-<epoch>.bin` beside the segments for the generation it
+just published (after the manifest is durable, so a snapshot can never describe a
+generation the manifest does not reference); the load adopts it when it proves it belongs
+to the data — same record count, same dimension — and otherwise rebuilds exactly as
+before. A corrupt snapshot degrades to a rebuild, never to a wrong answer
+(`w3_1_a_flush_persists_the_graph_and_a_corrupt_one_falls_back_to_a_rebuild`). Reclaim
+already treats `graph-*` as store files, so superseded snapshots go with their segments.
+
+| gate | before | after |
+|---|---|---|
+| usable access, 20k records | 21.4 s | **2.66 s** |
+| usable access, 100k records | 170.04 s | **13.08 s** |
+| lazy open call, 100k | 27.4 ms | 28.2 ms |
+| flush P99, 100k | 302.0 ms | 345.5 ms |
+
+The flush P99 rose ~43 ms because the flush now also writes the 28.8 MB graph — the price
+of the 13x open, and a thing to fix rather than a thing to hide.
+
+**Where the remaining 13 s lives:** 391 segments at ~33 ms each, and the same ~34 ms/segment
+shows up at 20k (78 segments, 2.66 s). It is now the ONLY term that matters on the load
+path, and it is per-segment codec work, not graph work — the next lever is the codec, not
+HNSW.
+
+The lesson worth keeping: "the primitive has tests" is not "the item is done". Both of
+these tests passed while the feature did nothing at all.
+
 ### Template for new entries
 
 ```
