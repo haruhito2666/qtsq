@@ -811,6 +811,63 @@ Evidence the change is safe: `test_vault_reentry`, `test_stream_crypto`,
 `test_censorship_kdf` all pass; Rust `memory::` 142 passed; JS suite 68 passed; C SFB suites
 all pass; a pre-change brain still opens and answers.
 
+### 2026-10-30 (night) — the load gate is now CPU-bound in serde, not in storage
+
+Chasing the last two plan gates, in the order the measurements demanded.
+
+**1. Argon2id per FILE (fixed, committed earlier tonight).** KDF v2 took the 100k open
+from 13.2 s to 2.9 s and the flush from 210 ms to 65 ms. Recorded above.
+
+**2. Segment decode across threads.** The container decoder is thread-safe — and that is
+proven rather than assumed: `seg_bench --threads 8` reads 89 real segments on 8 threads and
+checks every result against the sequential one. 470 ms -> 51 ms (9.2x), **0 mismatches**.
+An earlier attempt at this broke `legacy_encrypted_brain_migrates_with_backup` (records
+0/3) and I reverted it rather than ship an unproven ordering assumption. The version that
+landed carries a safety valve: if ANY segment in the parallel pass errors or reports that it
+needed the legacy password, the whole preload is DISCARDED and the loop reads sequentially
+exactly as it always did. The legacy test passes because it takes the old path byte for byte.
+
+**3. A deep clone in the loader.** `metas.push(r.meta.clone())` deep-cloned every record's
+JSON — 100k objects, every key and every text — and was the single largest cost of the open.
+Moving them instead (`std::mem::take`) plus pre-sizing the 25 MB vector buffer took the 20k
+open from 1.37 s to 0.23 s.
+
+**4. Records round-tripping through text.** The loader serialised 100k records into the meta
+document (470 ms) so hydrate could parse them straight back (135 ms). They now travel as
+values and hydrate converts them directly; the legacy single-file route keeps the string.
+
+Plus two flush costs: the anti-concurrent-writer check decrypted the entire manifest on every
+flush (a stat decides it now that we hold LOCK_EX and the bytes are our own), and the
+orphan/reclaim sweep ran two directory scans plus a filename parse per segment on every
+append-only flush (it now runs when the epoch changes, or every 64 flushes).
+
+| 100k records, dim 64, 200 flushes | before tonight | now |
+|---|---|---|
+| lazy open call | 27.3 ms | **0.9 ms** |
+| usable access | 170.04 s | **1.13 s** (0.114 s @ 20k — gate passes there) |
+| flush P99 | 345.5 ms | **63.2 ms** |
+| 10k texts -> 10k rows | PASS | PASS |
+
+**What is left, precisely.** The open is 1.13 s against a 1.0 s gate, and the remaining time
+is now `serde_json::Value -> RecordJson` for 100k records plus the 391-segment decode floor —
+CPU in serde, not storage, and not crypto. The flush is 63 ms against 50, and the C layer
+measures `pack 0.0 / encrypt 0.7 / write 0.4 ms` per container, so what is left is Rust
+bookkeeping for one 256-record segment and the manifest plus its fsyncs.
+
+**Any dimension: already true, and now proven.** `memory.open` round-trips dim 1, 2, 7, 16,
+32, 64, 384, 1024 and 8192; above that it refuses with `invalid vector dim 8193` instead of
+crashing. The earlier note in this journal claiming "64..4096" was wrong — that conflated
+`ai.embedLocal`'s 16-dimension floor with the store's 8192 cap. Two new tests
+(`crates/sofuu-core/tests/dim_range.rs`, `tests/memory_dim_test.js`, 101 assertions) pin it,
+both mutation-checked.
+
+**Recall@10 at 25k: the gate passes on the clustered fixture.** 1.0000 at ef 64, 128 and 256
+(dim 128) and at dim 64; it stays 1.0000 at sigma 0.25 and 0.5, so it is not knife-edge.
+The uniform-random fixture reaches only 0.642 / 0.788 / 0.892 at ef 64 / 128 / 256 — a
+near-degenerate distance shell means a fixed-width beam prunes true neighbours, so ~0.985
+there would need ef ~1500-3000. Uniform is informational; the gate is the clustered fixture
+at ef 64 (the shipped default).
+
 ### Template for new entries
 
 ```
