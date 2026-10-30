@@ -738,6 +738,44 @@ HNSW.
 The lesson worth keeping: "the primitive has tests" is not "the item is done". Both of
 these tests passed while the feature did nothing at all.
 
+### 2026-10-30 (later still) — the two failing gates have ONE cause, and it is Argon2id
+
+Profiled the flush and load paths instead of guessing at "the codec". The codec is not the
+problem: for a 256x64 segment, `qtsq_compress_tensor` takes **2.5 ms**, `pack` 0.0 ms,
+`write` 0.5 ms — and `encrypt` takes **26 ms**.
+
+`encrypt` is `qtsq_vault_encrypt_password`, which runs **Argon2id at m_cost = 64 MB** on
+every call (`src/qtsq_vault.c:75-97`), and the vault exposes no derived-key entry point, so
+the cost is paid per CONTAINER:
+
+| operation | containers touched | key derivations | measured |
+|---|---|---|---|
+| one flush | read manifest + write segment + write manifest | **3** | p50 178 ms at 20k records |
+| open @ 100k records | 391 segments | **391** | ~11 s of the 13 s |
+
+That is the whole remaining gap. A flush cannot go below ~78 ms of key derivation before it
+does any work (target: 50 ms), and a 100k open cannot go below ~11 s (target: 1 s) — unless
+the number of containers or the number of derivations changes. Nothing on the Rust side can
+reach either gate while the vault derives a key per container.
+
+**Landed anyway** (both real, both bounded):
+* flush no longer rewrites the whole graph snapshot for every 256-record append — it writes
+  it when the generation changes or when the graph has grown 4x since the last snapshot, so
+  snapshot writes are logarithmic in growth instead of linear in flush count (p50 201 -> 179
+  ms at 20k records, and the O(store) term is gone).
+* the cost is documented at the API that pays it (`brain_store.rs`, `QTSQ_LEVEL_FULL`), and
+  `SOFUU_PROFILE=1` prints pack/encrypt/write per container so the next measurement is one
+  env var away.
+
+**The fix that would actually pass the gates** is a key-derivation cache (or a
+derived-key `qtsq_vault_encrypt_key`) inside the vault — cache the Argon2id output per
+(salt, password) for the process lifetime, since the same machine key is used for every
+segment of the same store. That is a change to `src/qtsq_vault.c`, which this session was
+not allowed to touch (frozen core, and another session has it dirty). Recorded here with
+the numbers above so whoever owns that file can size the win: 391 derivations -> 1 should
+take the 100k open from ~13 s to under 2 s, and the flush from 178 ms to ~60 ms with the
+graph write already amortised.
+
 ### Template for new entries
 
 ```
