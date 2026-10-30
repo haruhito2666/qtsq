@@ -868,6 +868,59 @@ near-degenerate distance shell means a fixed-width beam prunes true neighbours, 
 there would need ef ~1500-3000. Uniform is informational; the gate is the clustered fixture
 at ef 64 (the shipped default).
 
+### 2026-10-30 (late) — the flush was compressing at 4.5 MB/s, and nobody had timed it
+
+Two gates were open: a 100k open under a second, and a flush P99 under 50 ms.
+
+**Open: CLOSED at 0.658 s (from 170.04 s at the start of the day).** The last
+step was a round trip: the segmented loader serialised all 100k record metadata
+values into the meta document (470 ms) purely so hydrate could parse them
+straight back out (135 ms) and produce the values it already had. They now
+travel as values. 1.13 s -> 0.658 s, against a 1.0 s limit.
+
+**Flush: 345.5 ms -> 34.5 ms P50 / 53.7 ms P99, still 3.7 ms over the 50 ms
+P99 target.** Three separate causes, none of them the disk:
+
+1. *The write was done twice.* Per-record CRCs must cover the vectors a reader
+   DECODES, and this container's tensor transform is not the identity (a 0.0
+   comes back as 2^-62). So the writer wrote the segment, decoded it, and —
+   because the CRCs live inside the metadata document — rebuilt and repacked
+   all 150 KB to change ~1 KB of numbers. It now probes the codec first (a
+   tensor-only container in tempdir), so the CRCs are right before the segment
+   is packed, and the read-back only confirms the prediction.
+
+2. *The codec is 4.5 MB/s and was being applied to everything.*
+   `qtsq_compress_tensor` cost **7.9 ms for a 32 KB segment tensor** to save
+   ~17 KB of writing, which costs 0.02 ms; `qtsq_compress_json` cost 3.3 ms
+   for 40 KB. Measured: fsync 0.06 ms, creating the file 0.10 ms. Every flush
+   was paying ~7 ms of CPU to avoid two hundredths of a millisecond of disk.
+   Streams up to 1 MB now use `QTSQ_LEVEL_STORE` — 7.9 ms -> **0.11 ms** — and
+   a stored tensor decodes bit-identically, which is what makes (1) safe to
+   skip. Payloads above 1 MB still compress at FULL.
+
+3. *The profiler was looking in the wrong place.* `[prof] pack / encrypt /
+   write` reported ~1.1 ms per container while the writer actually took 15 ms,
+   because `qtsq_compress_*` sat OUTSIDE the stopwatch. The lesson worth
+   keeping: a profiler that does not bracket the whole function will happily
+   report that a 56 ms operation takes 1 ms.
+
+**What is left: ~26 ms of flush bookkeeping** outside compression and writing
+— manifest rebuild, journal, publish — which has not been instrumented line by
+line, so it is not yet claimed. The next instrumented pass names it, and the
+likely next step is to stop rewriting the 391-entry manifest every flush and
+append the segment descriptor to the WAL instead.
+
+| 100k records, dim 64, 200 flushes | this morning | now |
+|---|---|---|
+| lazy open call | 27.3 ms | **0.9 ms** |
+| usable access | 170.04 s | **0.658 s** PASS |
+| flush P50 | 345.5 ms | **34.5 ms** |
+| flush P99 | 345.5 ms | **53.7 ms** (target 50) |
+| 10k texts -> 10k rows | PASS | PASS |
+
+All of it validated: `cargo test -p sofuu-core --lib memory::` 142 passed,
+0 failed, after every single change.
+
 ### Template for new entries
 
 ```
