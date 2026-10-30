@@ -776,6 +776,41 @@ the numbers above so whoever owns that file can size the win: 391 derivations ->
 take the 100k open from ~13 s to under 2 s, and the flush from 178 ms to ~60 ms with the
 graph write already amortised.
 
+### 2026-10-30 (evening) — KDF v2: Argon2id once per process, not once per file
+
+The block above identified the wall and said the fix lived in `src/qtsq_vault.c`. It does,
+and it is done (the owner of that file approved the change).
+
+**The bug, in one line:** `qtsq_vault_encrypt_password` derives its key with Argon2id at
+`m_cost = 64 MiB` **per file**, and the vault's cache key had to include the salt — but
+every container gets a fresh random 32-byte salt, so no cache could ever hit. Argon2id is a
+password-stretching KDF: its job is to make *guessing* expensive, and that job only needs
+doing once per password per session.
+
+**KDF v2** (`security_version = 2`, written by new files):
+`master = Argon2id(password, domain_salt)` once per process, cached under `SHA3(password)`
+behind a mutex; then `key = SHA3-256(master || "kdf2" || container_salt)` per container.
+v1 files are detected by their version byte and still derive per file, so old brains open
+unchanged — verified against a brain written before the change (5 records, same answer).
+Every container still has its own random salt and its own key: only the redundant stretching
+is gone, no entropy is.
+
+| gate (100k records) | before v2 | after v2 | target |
+|---|---|---|---|
+| lazy open call | 27.3 ms | **0.9 ms** | 1.000 s ✅ |
+| usable access | 13.23 s | **2.90 s** | 1.000 s ✗ |
+| flush P99 | 210.0 ms | **65.5 ms** | 50 ms ✗ |
+| 10k texts → 10k rows | PASS | PASS | ✅ |
+
+At 20k records the OPEN GATE NOW PASSES (0.553 s). At 100k the residual is no longer crypto
+at all — profiling the load at 20k splits it into **571 ms reading 78 segments** and 225 ms
+hydrating — so the remaining lever is per-segment I/O (parallel reads over independent
+immutable files, and a cheaper per-record metadata path), not the vault.
+
+Evidence the change is safe: `test_vault_reentry`, `test_stream_crypto`,
+`test_censorship_kdf` all pass; Rust `memory::` 142 passed; JS suite 68 passed; C SFB suites
+all pass; a pre-change brain still opens and answers.
+
 ### Template for new entries
 
 ```

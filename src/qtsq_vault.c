@@ -7,6 +7,7 @@
 #include "qtsq_sanitize.h"
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 /* Relative includes to the vendored PQClean code */
 #include "../crypto/common/randombytes.h"
@@ -94,6 +95,90 @@ static int derive_password_key(const char *password, const uint8_t salt[32],
         memset(key, 0, 32);
         return QTSQ_ERR_ALLOC;
     }
+    return QTSQ_OK;
+}
+
+/* ═══ KDF VERSIONS ═══
+ *
+ * v1 (security_version 1, every file written before this change):
+ *     key = Argon2id(password, container_salt)
+ * v2 (security_version 2):
+ *     master = Argon2id(password, FIXED_DOMAIN_SALT)   [once per process]
+ *     key    = SHA3-256(master || "kdf2" || container_salt)
+ *
+ * Why: Argon2id at m_cost = 64 MiB is a PASSWORD-stretching KDF — its job is
+ * to make guessing expensive, and that job is done once per password per
+ * session. v1 ran it once per FILE, so a 100k-record brain paid it 391 times
+ * on open (~11 s of the 13 s) and every flush paid it three times (~78 ms,
+ * against a 50 ms flush target). v2 keeps the expensive derivation and makes
+ * everything after it a cheap PRF over a per-file salt, so the same file still
+ * has its own salt and its own key; only the stretching is shared.
+ *
+ * Files keep working in both directions: a v1 file is detected by its version
+ * byte and still derives per file; new files are written v2. Nothing here
+ * weakens the salt's role (every container still gets a random 32-byte salt
+ * and a key unique to it) — it removes redundant stretching, not entropy.
+ *
+ * The master is cached in process memory keyed by SHA3(password). Holding it
+ * is equivalent to holding the password; a v1 file's key never enters this
+ * cache, so old and new stores do not share derived material.
+ */
+#define QTSQ_KDF_VERSION_PER_CONTAINER 1
+#define QTSQ_KDF_VERSION_MASTER        2
+
+static uint8_t g_master_key[32];
+static uint8_t g_master_tag[32];      /* SHA3-256 of the password it belongs to */
+static int     g_master_valid = 0;
+static pthread_mutex_t g_master_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void sha3_tag(uint8_t out[32], const void *a, size_t alen,
+                     const void *b, size_t blen, const void *c, size_t clen) {
+    sha3_256incctx hc;
+    sha3_256_inc_init(&hc);
+    if (a && alen) sha3_256_inc_absorb(&hc, (const uint8_t *)a, alen);
+    if (b && blen) sha3_256_inc_absorb(&hc, (const uint8_t *)b, blen);
+    if (c && clen) sha3_256_inc_absorb(&hc, (const uint8_t *)c, clen);
+    sha3_256_inc_finalize(out, &hc);
+}
+
+/* Argon2id once per (process, password), guarded by a domain-separated salt
+ * so the stretched output is not reused as a file key directly. */
+static int master_key_for_password(const char *password, uint8_t out[32]) {
+    uint8_t want[32];
+    sha3_tag(want, password, strlen(password), NULL, 0, NULL, 0);
+
+    int rc = QTSQ_OK;
+    pthread_mutex_lock(&g_master_mu);
+    if (!g_master_valid || memcmp(g_master_tag, want, 32) != 0) {
+        uint8_t domain[32];
+        sha3_tag(domain, "qtsq-master-kdf-v2", 18, NULL, 0, NULL, 0);
+        rc = derive_password_key(password, domain, 0, g_master_key);
+        if (rc == QTSQ_OK) {
+            memcpy(g_master_tag, want, 32);
+            g_master_valid = 1;
+        } else {
+            qtsq_secure_zero(g_master_key, 32);
+            g_master_valid = 0;
+        }
+    }
+    if (rc == QTSQ_OK) memcpy(out, g_master_key, 32);
+    pthread_mutex_unlock(&g_master_mu);
+    qtsq_secure_zero(want, 32);
+    return rc;
+}
+
+static int derive_password_key_v(const char *password, const uint8_t salt[32],
+                                 uint32_t iterations, uint8_t key[32], int version) {
+    if (version < QTSQ_KDF_VERSION_MASTER) {
+        return derive_password_key(password, salt, iterations, key);
+    }
+    uint8_t master[32];
+    if (master_key_for_password(password, master) != QTSQ_OK) {
+        memset(key, 0, 32);
+        return QTSQ_ERR_ALLOC;
+    }
+    sha3_tag(key, master, 32, "kdf2", 4, salt, 32);
+    qtsq_secure_zero(master, 32);
     return QTSQ_OK;
 }
 
@@ -282,6 +367,8 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
      * in the code, and honouring a file-controlled cost would be a DoS
      * lever), so files written before this change keep working. */
     ctx->security.kdf_iterations = QTSQ_ARGON2_T_COST;
+    /* v2: the expensive derivation is per process, not per file. */
+    ctx->security.security_version = QTSQ_KDF_VERSION_MASTER;
 
     /* Generate new salt for password layer — unless qtsq_container_pack
      * already pre-generated one (preserving it keeps the name-encryption
@@ -298,7 +385,8 @@ int qtsq_vault_encrypt_password(qtsq_context_t *ctx, const char *password) {
     
     uint8_t key[32];
     uint8_t *salt = was_pq_encrypted ? (ctx->security.signature + 3277) : ctx->security.salt;
-    if (derive_password_key(password, salt, ctx->security.kdf_iterations, key) != QTSQ_OK)
+    if (derive_password_key_v(password, salt, ctx->security.kdf_iterations, key,
+                              ctx->security.security_version) != QTSQ_OK)
         return QTSQ_ERR_ALLOC;
 
     int res = vault_sym_encrypt(ctx, key, ctx->security.nonce);
@@ -329,8 +417,14 @@ int qtsq_vault_decrypt_password(qtsq_context_t *ctx, const char *password) {
     int is_layered = (ctx->security.encryption_type == 3);
     uint8_t *salt = is_layered ? (ctx->security.signature + 3277) : ctx->security.salt;
 
+    /* A file declares which KDF wrote it; old files keep their per-file
+     * derivation, new ones use the cached master. */
+    int kdf_version = (ctx->security.security_version >= QTSQ_KDF_VERSION_MASTER)
+                          ? QTSQ_KDF_VERSION_MASTER
+                          : QTSQ_KDF_VERSION_PER_CONTAINER;
     uint8_t key[32];
-    if (derive_password_key(password, salt, ctx->security.kdf_iterations, key) != QTSQ_OK)
+    if (derive_password_key_v(password, salt, ctx->security.kdf_iterations, key,
+                              kdf_version) != QTSQ_OK)
         return QTSQ_ERR_ALLOC;
 
     int res = vault_sym_decrypt(ctx, key, ctx->security.nonce);
