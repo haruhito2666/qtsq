@@ -86,7 +86,7 @@ QTC_OBJ    = $(patsubst compressor/src/%.c,compressor/src/%.o,$(QTC_SRC))
 .PHONY: all lib demos cli bench-sha viewer studio studio-app photon-studio \
         photon-studio-app metallib xcodeproj vtxdump dylib test test_model \
         test_qtc test_video_pixel test_all_phases test_format_spec \
-        test_photon test_tsubu clean
+        test_audio_standard test_audio_standard_stress test_photon test_tsubu clean
 
 all: lib cli viewer studio photon-studio demos
 
@@ -214,6 +214,22 @@ test_video_pixel: $(LIB)
 	$(CC) $(CFLAGS) -O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_video_pixel.c -L. -lqtsq $(LDFLAGS) -lc++ -o bin/test_video_pixel
 	./bin/test_video_pixel
 
+# Standard audio type: MDCT2 rate control across tiers/sample rates,
+# stereo-default/mono-fallback policy, and decode metadata.
+test_audio_standard: $(LIB)
+	@mkdir -p bin
+	@echo "═══ Standard Audio (MDCT2) ═══"
+	$(CC) $(CFLAGS) -O0 -g tests/test_audio_standard.c -L. -lqtsq $(LDFLAGS) -lc++ -o bin/test_audio_standard
+	./bin/test_audio_standard
+
+# Hardening pass: extreme signals/rates, NaN/Inf/denormals, determinism,
+# concurrent encoders, truncation/bit-flip fuzz, absurd sizes, 60 s clip.
+test_audio_standard_stress: $(LIB)
+	@mkdir -p bin
+	@echo "═══ Standard Audio Hardening ═══"
+	$(CC) $(CFLAGS) -O0 -g tests/test_audio_standard_stress.c -L. -lqtsq $(LDFLAGS) -lc++ -o bin/test_audio_standard_stress
+	./bin/test_audio_standard_stress
+
 # Spec conformance: parse real containers using only the offsets in
 # docs/FORMAT.md, and confirm damaged files are rejected. Writing the
 # spec is not enough on its own -- this is what stops the two drifting
@@ -236,7 +252,8 @@ PHASE_TESTS = test_layered_encryption test_shamir_csprng test_two_intent \
               test_geometry_seal test_freqdct test_container_name_enc \
               test_security test_gf256 test_splat2d test_surfel \
               test_photon_fusion test_turbo test_model test_stream_crypto \
-              test_qtc_integration test_video_pixel test_vault_reentry test_censorship_kdf test_shamir_security test_container_bounds
+              test_qtc_integration test_video_pixel test_vault_reentry test_censorship_kdf test_shamir_security test_container_bounds \
+              test_audio_standard test_audio_standard_stress
 
 define RUN_PHASE_TESTS
 	@mkdir -p bin

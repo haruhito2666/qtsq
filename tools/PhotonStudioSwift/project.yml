@@ -1,0 +1,51 @@
+# Photon Studio — Xcode project spec (xcodegen).
+#
+# Lives inside the app's self-contained source folder; generates
+# PhotonStudio.xcodeproj at the repo root (next to QTSQStudio.xcodeproj).
+# Run from the repo root (--project is the DIRECTORY the project goes in):
+#
+#   xcodegen generate --spec tools/PhotonStudioSwift/project.yml --project .
+#
+# or `make xcodeproj`. The Makefile remains the canonical build path —
+# these projects are the Xcode convenience, kept in sync with the same
+# flags (bridging header, include paths, libqtsq/libqtc/opus link line).
+
+name: PhotonStudio
+options:
+  bundleIdPrefix: com.qtsq
+targets:
+  PhotonStudio:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: .
+        excludes:
+          - "Info.plist"
+          - "project.yml"
+    settings:
+      PRODUCT_NAME: PhotonStudio
+      PRODUCT_BUNDLE_IDENTIFIER: com.qtsq.PhotonStudio
+      SWIFT_VERSION: "5.0"
+      GENERATE_INFOPLIST_FILE: NO
+      INFOPLIST_FILE: $(PROJECT_DIR)/tools/PhotonStudioSwift/Info.plist
+      SWIFT_OBJC_BRIDGING_HEADER: $(PROJECT_DIR)/tools/PhotonStudioSwift/BridgingHeader.h
+      HEADER_SEARCH_PATHS:
+        - $(inherited)
+        - $(PROJECT_DIR)/include
+        - $(PROJECT_DIR)/compressor/include
+        - $(PROJECT_DIR)/crypto/common
+        - $(PROJECT_DIR)/crypto/ml-kem-768
+        - $(PROJECT_DIR)/crypto/ml-dsa-65
+        - $(PROJECT_DIR)/crypto/argon2
+      LIBRARY_SEARCH_PATHS:
+        - $(inherited)
+        - $(PROJECT_DIR)
+        - $(PROJECT_DIR)/compressor
+        - /opt/homebrew/Cellar/opus/1.6.1/lib
+      OTHER_LDFLAGS: $(inherited) -lqtsq -lqtc -lopus -framework Metal -framework Foundation -framework AVFoundation -framework CoreBluetooth -framework Security -lz -lc++
+schemes:
+  PhotonStudio:
+    build:
+      targets:
+        PhotonStudio: all

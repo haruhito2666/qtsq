@@ -225,6 +225,20 @@ static int afloat_encode_lossless(const float *pcm, uint32_t nframes,
 
 /* Lossy: scale to full-range int16, run the MDCT2 perceptual coder, store
  * the peak so decode restores float levels. */
+static inline float afloat_sanitize(float v)
+{
+    /* The lossy core is 16-bit-equivalent. Map NaN to silence and clip
+     * both infinities to full scale; leaving them in the peak scan made
+     * scale 0 (Inf) and sent NaN to lrint(), which is undefined. */
+    if (isnan(v))
+        return 0.0f;
+    if (v > 1.0f)
+        return 1.0f;
+    if (v < -1.0f)
+        return -1.0f;
+    return v;
+}
+
 static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
                                uint8_t channels, float quality,
                                int target_kbps, int sample_rate,
@@ -234,7 +248,7 @@ static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
 
     float peak = 0.0f;
     for (size_t i = 0; i < total; i++) {
-        float a = fabsf(pcm[i]);
+        float a = fabsf(afloat_sanitize(pcm[i]));
         if (a > peak)
             peak = a;
     }
@@ -245,11 +259,20 @@ static int afloat_encode_lossy(const float *pcm, uint32_t nframes,
 
     if (peak > 0.0f) {
         double scale = 32767.0 / (double)peak;
-        for (size_t i = 0; i < total; i++) {
-            double v = (double)pcm[i] * scale;
-            if (v > 32767.0) v = 32767.0;
-            if (v < -32768.0) v = -32768.0;
-            i16[i] = (int16_t)lrint(v);
+        /* A denormal peak can overflow the reciprocal to +Inf; 0*Inf is
+         * NaN, so treat an unusable scale as silence rather than feeding
+         * NaN to lrint(). */
+        if (!isfinite(scale) || scale <= 0.0) {
+            memset(i16, 0, total * sizeof(int16_t));
+        } else {
+            for (size_t i = 0; i < total; i++) {
+                double v = (double)afloat_sanitize(pcm[i]) * scale;
+                if (!isfinite(v))
+                    v = 0.0;
+                if (v > 32767.0) v = 32767.0;
+                if (v < -32768.0) v = -32768.0;
+                i16[i] = (int16_t)lrint(v);
+            }
         }
     } else {
         memset(i16, 0, total * sizeof(int16_t));
@@ -345,6 +368,10 @@ static int afloat_decode_lossy(const uint8_t *payload, size_t payload_len,
     if (payload_len < AFLOAT_HDR + 4)
         return QTC_ERR_CORRUPT;
     float peak = getf32(payload + AFLOAT_HDR);
+    /* A corrupt peak of NaN/Inf (or a negative value) would poison every
+     * decoded sample; reject it before scaling. */
+    if (!isfinite(peak) || peak < 0.0f || peak > 1.0e6f)
+        return QTC_ERR_CORRUPT;
 
     uint8_t *i16pcm = NULL;
     uint32_t nf = 0;

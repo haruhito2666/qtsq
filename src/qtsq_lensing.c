@@ -402,6 +402,11 @@ static int store_raw_int16(qtsq_context_t *ctx, const int16_t *samples,
 static int store_qtc_mdct2(qtsq_context_t *ctx, const int16_t *samples,
                            size_t num_samples, uint32_t sample_rate,
                            uint8_t channels) {
+    /* The [u32 raw_bytes] framing and schema dimension are 32-bit. Check
+     * before multiplying so a huge size_t cannot wrap into a small value
+     * on 32-bit builds. */
+    if (num_samples > (size_t)UINT32_MAX / sizeof(int16_t))
+        return QTSQ_ERR_TOO_LARGE;
     size_t raw_bytes = num_samples * sizeof(int16_t);
     if (channels == 0 || num_samples % channels != 0) return QTSQ_ERR_FORMAT;
     uint32_t nframes = (uint32_t)(num_samples / channels);
@@ -410,6 +415,10 @@ static int store_qtc_mdct2(qtsq_context_t *ctx, const int16_t *samples,
     qtc_options_default(&opts);
     opts.mode = QTC_MODE_LOSSY;
     opts.quality = (ctx->quality > 0.0f) ? ctx->quality : 0.5f;
+    /* Rate control divides the kbps target by the stream's actual rate.
+     * Leaving this 0 made MDCT2 assume 44.1 kHz, so 48/96 kHz streams
+     * produced 9%/118% more bytes than the selected tier. */
+    opts.sample_rate = (int)sample_rate;
 
     uint8_t *body = NULL;
     size_t body_len = 0;
@@ -454,8 +463,14 @@ int qtsq_compress_audio(qtsq_context_t *ctx, const int16_t *samples,
                         uint8_t channels) {
     if (!ctx || !samples) return QTSQ_ERR_NULL;
     if (num_samples == 0) return QTSQ_ERR_TOO_SMALL;
+    if (num_samples > (size_t)UINT32_MAX / sizeof(int16_t))
+        return QTSQ_ERR_TOO_LARGE;
     if (channels == 0) channels = 1;
-    if (channels > 2) channels = 2;
+    /* Standard audio is stereo. Mono is accepted only when the caller has
+     * a mono source; silently reinterpreting a 3+ channel interleaved
+     * buffer as stereo would scramble the channel order. Downmix to
+     * stereo (or encode with another codec) before calling. */
+    if (channels > 2) return QTSQ_ERR_FORMAT;
 
     /* Phase 7: Creative intent uses Opus regardless of the codec selection
      * (measured ~34% smaller than qtc MDCT2 on clean tonal content). Now
@@ -477,6 +492,16 @@ int qtsq_compress_audio(qtsq_context_t *ctx, const int16_t *samples,
      * branch is lossy and must never run for Provenance. */
     if (ctx->intent == QTSQ_INTENT_PROVENANCE) {
         return store_raw_int16(ctx, samples, num_samples, sample_rate, channels);
+    }
+
+    /* Standard intent (None): the standard lossy type is MDCT2, not the
+     * legacy spectral dictionary below. The spectral coder is lossless-
+     * ish and expands already-compressed media; it stays reachable only
+     * through the explicit zlib opt-out (and old files still decode).
+     * This is what gives the int16 callers -- Android, iOS, the CLI --
+     * the same MP3-comparable size as the float capture path. */
+    if (ctx->codec == QTSQ_CODEC_QTC) {
+        return store_qtc_mdct2(ctx, samples, num_samples, sample_rate, channels);
     }
 
     size_t spc = num_samples / channels;
@@ -1201,10 +1226,17 @@ int qtsq_compress_audio_float(qtsq_context_t *ctx, const float *samples,
     if (!ctx || !samples) return QTSQ_ERR_NULL;
     if (num_samples == 0) return QTSQ_ERR_TOO_SMALL;
     if (channels == 0) channels = 1;
-    if (channels > 16) channels = 16;
+    /* Standard audio is stereo; mono is a fallback for mono-only sources
+     * (microphones, mono files), never a second-class copy of a stereo
+     * signal. Rejecting >2 keeps the interleaving interpretable. */
+    if (channels > 2) return QTSQ_ERR_FORMAT;
     if (num_samples % channels != 0) return QTSQ_ERR_FORMAT;
     uint32_t nframes = (uint32_t)(num_samples / channels);
 
+    /* Check in 64-bit before multiplying: on a 32-bit build the size_t
+     * product can wrap to a small value that then passes the u32 test. */
+    if ((uint64_t)num_samples * sizeof(float) > UINT32_MAX)
+        return QTSQ_ERR_TOO_LARGE;
     size_t raw_bytes = num_samples * sizeof(float);
     /* Phase 7: raised from 1 GB toward qtc's ceiling now that the LZ layer
      * handles large streams. The [u32 raw_bytes] framing bounds the payload
@@ -1218,6 +1250,10 @@ int qtsq_compress_audio_float(qtsq_context_t *ctx, const float *samples,
     if (ctx->codec == QTSQ_CODEC_QTC) {
         qtc_options_t opts;
         qtc_options_default(&opts);
+        /* The MDCT2 rate controller needs the real stream rate. 0 means
+         * "assume 44.1 kHz", which made every 48/96 kHz capture larger
+         * than the selected tier. */
+        opts.sample_rate = (int)sample_rate;
         if (ctx->quality > 0.0f) {
             opts.mode = QTC_MODE_LOSSY;
             opts.quality = ctx->quality;
@@ -1253,9 +1289,8 @@ int qtsq_compress_audio_float(qtsq_context_t *ctx, const float *samples,
     ctx->singularity = out;
     ctx->singularity_size = 4 + body_len;
     ctx->header.strategy = QTSQ_STRATEGY_PROCEDURAL;
-    ctx->header.data_type = (channels >= 3) ? QTSQ_TYPE_AUDIO_MULTI :
-                            (channels == 2) ? QTSQ_TYPE_AUDIO_STEREO :
-                                              QTSQ_TYPE_AUDIO_MONO;
+    ctx->header.data_type = (channels == 2) ? QTSQ_TYPE_AUDIO_STEREO
+                                             : QTSQ_TYPE_AUDIO_MONO;
     ctx->header.original_size = raw_bytes;
     ctx->header.num_channels = channels;
     ctx->header.sample_depth = 32;

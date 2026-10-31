@@ -180,18 +180,43 @@ int qtsq_compress_gravitational_audio(qtsq_context_t *ctx,
 int qtsq_decompress_gravitational_audio(const qtsq_context_t *ctx,
                                           uint8_t **out_data, size_t *out_size);
 
+/* Standard int16 audio. channels must be 1 (mono source) or 2 (stereo);
+ * >2 is rejected rather than silently reinterpreted. Creative intent uses
+ * Opus when available (qtc MDCT2 otherwise); Provenance uses the bit-exact
+ * lossless raw-int16 path. Intent None uses the standard MDCT2 type at
+ * ctx->quality (default 128 kbps) when qtc is active -- the same path as
+ * qtsq_compress_audio_float(); the legacy spectral coder is reached only
+ * with the explicit zlib opt-out. */
 int qtsq_compress_audio(qtsq_context_t *ctx,
                        const int16_t *samples,
                        size_t num_samples,
                        uint32_t sample_rate,
                        uint8_t channels);
 
-/* Phase 6b: float32 audio capture path (microphone / DSP). num_samples is
- * TOTAL samples (nframes * channels), interleaved. The default codec is qtc
- * (Phase 7): the qtc AUDIO_FLOAT lens is used — bit-exact lossless for every
- * IEEE-754 pattern (denormals/inf/NaN/-0); ctx->quality > 0 selects the
- * lossy int16-MDCT2 adapter. Setting ctx->codec = QTSQ_CODEC_ZLIB opts out
- * to raw floats under zlib (lossless). */
+/* Standard float32 audio capture path (microphone / DSP / file import).
+ * num_samples is TOTAL samples (nframes * channels), interleaved.
+ * channels must be 1 or 2; >2 is rejected. Stereo is the default; mono is
+ * accepted only for a mono source (do not duplicate a mono signal into a
+ * fake stereo pair).
+ *
+ * The standard lossy type is qtc's MDCT2 perceptual coder. ctx->quality
+ * selects a TOTAL stream bitrate tier, identical for mono and stereo:
+ *      1.0 → 320 kbps   0.85 → 192 kbps
+ *      0.5 → 128 kbps   0.25 → 96 kbps
+ * The rate controller divides by the real sample_rate, so the same tier
+ * produces the same size at 44.1/48/96 kHz, and it pads the payload to
+ * the tier size so tonal, broadband and silent content of the same
+ * duration also produce the same byte count. The output is float32 on the
+ * wire (32-bit sample_depth) but the lossy core is 16-bit-equivalent.
+ * ctx->quality == 0 selects the bit-exact lossless lens instead (every
+ * IEEE-754 pattern, including denormals/inf/NaN/-0).
+ * In LOSSY mode the 16-bit boundary is sanitized: NaN becomes silence,
+ * +/-Inf and values outside [-1, 1] clip to full scale, and a denormal
+ * peak is treated as silence. The one-shot encoder rejects inputs whose
+ * working set would exceed 4 GiB (roughly 1 h of 44.1 kHz stereo) with
+ * QTSQ_ERR_TOO_LARGE rather than risking an OOM kill.
+ * Setting ctx->codec = QTSQ_CODEC_ZLIB opts out to raw floats under zlib
+ * (lossless, no MDCT2). */
 int qtsq_compress_audio_float(qtsq_context_t *ctx,
                               const float *samples,
                               size_t num_samples,

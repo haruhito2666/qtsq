@@ -80,7 +80,11 @@ typedef struct {
     uint32_t     flags;             /* QTC_FLAG_*                        */
     uint32_t     min_compress_size; /* 0 → QTC_CHANDRASEKHAR_LIMIT       */
     int          target_kbps;       /* lossy audio bitrate target; 0 =
-                                       derive from quality (Phase 5.7)   */
+                                       derive from quality (Phase 5.7).
+                                       The MDCT2 lens is CBR: it pads
+                                       the payload to this total size, so
+                                       the byte count does not depend on
+                                       the content or its LZ ratio.       */
     /* Sample rate of any audio passed in. The lossy lens converts a
      * kbps target into a bits-per-coefficient budget, and that budget is
      * only correct if it divides by the stream's ACTUAL rate -- it used

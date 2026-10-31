@@ -89,15 +89,19 @@ recovered_csv = qtsq.decompress_text("data.qtsq")
 
 ## Audio
 
-qtsq audio is **stereo-only**. Mono costs the same space as the stereo
-pair — the mid/side coder needs both channels to decorrelate — so mono
-streams are rejected rather than stored at half value.
+The standard audio type is **stereo**. A mono source stays mono instead
+of being duplicated into a fake stereo pair; more than two channels are
+rejected (downmix to stereo first). The bitrate tier is a **total**
+stream bitrate, so mono and stereo files of the same duration and tier
+have the same size — mono simply gets more bits per channel.
 
 ### Lossless (Python)
 
 `save_audios()` codes raw interleaved PCM with the qtc audio lens,
 bit-exact, measured at roughly 7–50x on speech-grade material depending
-on content. 8/16/24-bit samples are accepted; channels must be exactly 2.
+on content. 8/16/24-bit samples are accepted; this lossless BLB1 stream
+is stereo-only (channels must be exactly 2). The lossy standard path
+below accepts mono as well.
 
 ```python
 import numpy as np
@@ -119,19 +123,40 @@ bit-exact. This path does not record a sample rate in the manifest
 `qtsq_compress_audio_float()` with `ctx.quality > 0` selects the MDCT2
 perceptual coder at a target bitrate — the same path QTSQStudio uses for
 capture. It measured at MP3 parity (±1 dB PSNR against LAME 3.100 at
-matched bitrate) on 48 kHz stereo.
+matched bitrate) on 48 kHz stereo. The tier is a total stream bitrate,
+and rate control divides by the stream's actual sample rate, so the same
+duration and tier produce the same size at 44.1, 48 and 96 kHz. Size is
+also content-independent: the packed payload is padded to the tier size,
+so a sparse tonal track, broadband noise and silence of the same duration
+all produce the same byte count at a given tier.
 
-| `ctx.quality` | Target | Payload on a 220.8 s reference |
+| `ctx.quality` | Target (total) | Payload on a 220.8 s reference |
 |---|---|---|
 | 1.0 | 320 kbps | 8.83 MB |
 | 0.85 | 192 kbps | 5.30 MB |
 | 0.5 | 128 kbps | 3.53 MB |
 | 0.25 | 96 kbps | 2.65 MB |
 
-At 128 kbps the result is 3.54 MB against a 3.59 MB source MP3, i.e. the
-size you get from an MP3 encoder at that rate. Lossy streams set
-`QTSQ_FLAG_LOSSY`; their SHA-256 covers the original floats, so readers
-skip checksum verification for them.
+At 128 kbps the payload is 3.53 MB against a 3.59 MB source MP3, i.e. the
+size you get from an MP3 encoder at that rate. (The `.qtsq` envelope adds
+a fixed few KB for the header, TOC and encryption block, so short clips
+are marginally larger than their MP3; on a song it is lost in the
+rounding.) Lossy streams set `QTSQ_FLAG_LOSSY`; their SHA-256 covers the
+original floats, so readers skip checksum verification for them.
+
+QTSQStudio does not ask you to pick a tier. It reads the source file's
+average bitrate and targets that (minus the container envelope), so
+importing an MP3-sized file produces an MP3-sized `.qtsq`: a 3,535,515 B,
+220.9 s source came out at 3,535,350 B. Lossless inputs cap at the
+320 kbps top tier. The audio format picker offers **Standard** and
+**Photon**; Photon is a coming-later placeholder for the spatial codec.
+
+The standard path is hardened at both boundaries: NaN float samples
+become silence, ±Inf and out-of-range values clip to full scale, absurd
+sample counts are rejected before any memory is touched, and the one-shot
+encoder caps its working set at 4 GiB (about an hour of 44.1 kHz stereo,
+30 minutes at 96 kHz, 15 at 192 kHz). Longer inputs return a clean error
+instead of being OOM-killed.
 
 ```c
 #include "qtsq.h"
@@ -139,9 +164,11 @@ skip checksum verification for them.
 
 qtsq_context_t ctx;
 qtsq_init(&ctx);
-ctx.quality = 0.5f;                      /* 128 kbps */
+ctx.quality = 0.5f;                      /* 128 kbps total */
 
-qtsq_compress_audio_float(&ctx, pcm_f32, nframes * 2, 44100, 2);
+/* channels is 1 or 2; num_samples = nframes * channels */
+qtsq_compress_audio_float(&ctx, pcm_f32, nframes * channels,
+                          sample_rate, channels);
 
 qtsq_vault_encrypt_password(&ctx, "passphrase");   /* writes are encrypted */
 qtsq_write(&ctx, "song.qtsq");
@@ -152,11 +179,17 @@ already at the playback engine's native format) or the generic
 `qtsq_decompress()`, which routes `sample_depth == 32` audio to the float
 decoder. Decoding returns 32-bit floats, not int16.
 
+The int16 `qtsq_compress_audio()` path — the one Android and iOS call —
+routes intent-less audio to the same MDCT2 standard type at 128 kbps by
+default, so those platforms get MP3-sized files without app changes. The
+CLI reads 8/16/24-bit PCM and 32-bit int/float WAV and converts all of
+them to the float standard path.
+
 A lossless spectral-dictionary codec (`qtsq_compress_audio`, strategy
-`Fourier`) exists and still decodes old files, but it is not used for new
-captures: it is lossless, and on already-compressed sources such as MP3
-it has no redundancy left to exploit — it expanded a 3.4 MB MP3 to
-16.1 MB.
+`Fourier`) still decodes old files and remains reachable through the
+explicit zlib opt-out, but it is not the standard type: it is
+lossless-ish, and on already-compressed sources such as MP3 it has no
+redundancy left to exploit — it expanded a 3.4 MB MP3 to 16.1 MB.
 
 ---
 
