@@ -129,8 +129,12 @@ static void generate_random_bytes(uint8_t *out, size_t len) {
     /* arc4random_buf is seeded by the OS kernel — CSPRNG, no setup needed */
     arc4random_buf(out, len);
 #elif defined(__linux__) || defined(__ANDROID__) || defined(__unix__) || defined(__EMSCRIPTEN__)
-    /* Prefer getrandom() on Linux/Android: no file descriptor, no path. */
-    #if defined(__linux__) || defined(__ANDROID__)
+    /* Prefer getrandom() on Linux/Android: no file descriptor, no path.
+     * Bionic only exports getrandom() from API 28 — below that the
+     * declaration is hidden from <sys/random.h> and the symbol does not
+     * exist in libc, so Android < 28 falls through to /dev/urandom, which
+     * the code below already handles (still a CSPRNG). */
+    #if defined(__linux__) && (!defined(__ANDROID__) || (defined(__ANDROID_API__) && __ANDROID_API__ >= 28))
     size_t got = 0;
     while (got < len) {
         ssize_t r = getrandom(out + got, len - got, 0);
